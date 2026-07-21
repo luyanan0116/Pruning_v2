@@ -49,7 +49,15 @@ def main():
     parser.add_argument("--lcb_lambda", type=float, default=1.0, help="LCB risk coefficient lambda")
     parser.add_argument("--n_samples_lcb", type=int, default=10, help="number of repeated LCB estimates")
     parser.add_argument("--prune_per_layer", type=int, default=0,
-                        help="exact MLP channels removed per layer; 0 uses sparsity_ratio")
+                        help="exact MLP channels removed per layer; 0 uses mlp_sparsity_ratio/sparsity_ratio")
+    parser.add_argument("--attention_prune_per_layer", type=int, default=0,
+                        help="exact attention heads removed per layer; 0 uses attention_sparsity_ratio/sparsity_ratio")
+    parser.add_argument("--mlp_sparsity_ratio", type=float, default=None,
+                        help="structured MLP-channel sparsity; default uses sparsity_ratio")
+    parser.add_argument("--attention_sparsity_ratio", type=float, default=None,
+                        help="structured attention-head sparsity; default uses sparsity_ratio")
+    parser.add_argument("--paper_prune_targets", type=str, default="mlp,attention",
+                        help="comma-separated structured targets: mlp,attention")
     parser.add_argument("--paper_prune_step", type=int, default=10,
                         help="export selected channel indices in batches of this size")
     parser.add_argument("--paper_score_nsamples", type=int, default=32,
@@ -90,8 +98,18 @@ def main():
     args = parser.parse_args()
     if args.sparsity_ratio != 0 and args.prune_method is None:
         parser.error("--prune_method is required when --sparsity_ratio is non-zero")
-    if args.prune_method in PAPER_METHODS and args.prune_per_layer <= 0 and not 0 < args.sparsity_ratio < 1:
-        parser.error("paper methods require --prune_per_layer > 0 or --sparsity_ratio in (0,1)")
+    if args.prune_method in PAPER_METHODS:
+        targets = {part.strip().lower() for part in args.paper_prune_targets.split(",") if part.strip()}
+        aliases = {"attn": "attention", "head": "attention", "heads": "attention", "ffn": "mlp"}
+        targets = {aliases.get(value, value) for value in targets}
+        if not targets or not targets.issubset({"mlp", "attention"}):
+            parser.error("--paper_prune_targets must contain mlp and/or attention")
+        mlp_ratio = args.sparsity_ratio if args.mlp_sparsity_ratio is None else args.mlp_sparsity_ratio
+        attn_ratio = args.sparsity_ratio if args.attention_sparsity_ratio is None else args.attention_sparsity_ratio
+        if "mlp" in targets and args.prune_per_layer <= 0 and not 0 < mlp_ratio < 1:
+            parser.error("MLP pruning requires --prune_per_layer > 0 or a ratio in (0,1)")
+        if "attention" in targets and args.attention_prune_per_layer <= 0 and not 0 < attn_ratio < 1:
+            parser.error("attention pruning requires --attention_prune_per_layer > 0 or a ratio in (0,1)")
 
     # Setting seeds for reproducibility
     np.random.seed(args.seed)

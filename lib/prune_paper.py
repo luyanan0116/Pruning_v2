@@ -3,14 +3,15 @@ from __future__ import annotations
 import json
 from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, Mapping, Sequence
+from typing import Dict, Mapping
 
 import numpy as np
 import torch
 
 from .data import get_loaders
-from .paper_pruning.apply import zero_mlp_channels_
+from .paper_pruning.apply import zero_structured_units_
 from .paper_pruning.collector import (
+    UNIT_TYPES,
     collect_gradient_response_cache,
     load_response_cache,
 )
@@ -31,6 +32,7 @@ from .paper_pruning.selection import resolve_prune_count, select_bottom_k
 
 
 PAPER_METHODS = {"paper_mi", "paper_mi_gb", "paper_mi_gb_lcb", "lcb"}
+METHODS = ("paper_mi", "paper_mi_gb", "paper_mi_gb_lcb")
 
 
 def _parse_float_tuple(raw: str) -> tuple[float, ...]:
@@ -38,6 +40,23 @@ def _parse_float_tuple(raw: str) -> tuple[float, ...]:
     if not values:
         raise ValueError("expected at least one comma-separated float")
     return values
+
+
+def _parse_targets(raw: str) -> tuple[str, ...]:
+    aliases = {"attn": "attention", "head": "attention", "heads": "attention", "ffn": "mlp"}
+    targets = []
+    for part in raw.split(","):
+        value = part.strip().lower()
+        if not value:
+            continue
+        value = aliases.get(value, value)
+        if value not in UNIT_TYPES:
+            raise ValueError(f"unknown paper prune target: {value}; choose from mlp,attention")
+        if value not in targets:
+            targets.append(value)
+    if not targets:
+        raise ValueError("at least one paper prune target is required")
+    return tuple(targets)
 
 
 def _canonical_method(method: str) -> str:
@@ -93,32 +112,63 @@ def _pipeline_config(args) -> PipelineConfig:
     )
 
 
-def _config_payload(args, config: PipelineConfig, cache) -> dict:
+def _target_budget(args, unit_type: str) -> tuple[float, int]:
+    if unit_type == "mlp":
+        ratio = args.mlp_sparsity_ratio
+        exact = args.prune_per_layer
+    elif unit_type == "attention":
+        ratio = args.attention_sparsity_ratio
+        exact = args.attention_prune_per_layer
+    else:
+        raise ValueError(unit_type)
+    if ratio is None:
+        ratio = args.sparsity_ratio
+    return float(ratio), int(exact)
+
+
+def _config_payload(args, config: PipelineConfig, cache, targets: tuple[str, ...]) -> dict:
     payload = {
         "pipeline": asdict(config),
-        "sparsity_ratio": float(args.sparsity_ratio),
-        "prune_per_layer": int(args.prune_per_layer),
+        "targets": list(targets),
+        "budgets": {
+            unit_type: {
+                "sparsity_ratio": _target_budget(args, unit_type)[0],
+                "prune_per_layer": _target_budget(args, unit_type)[1],
+            }
+            for unit_type in targets
+        },
         "prune_step": int(args.paper_prune_step),
         "response_cache": str(cache.root.resolve()),
         "num_observations": cache.num_observations,
         "response_length": cache.response_length,
         "unit_counts": cache.unit_counts,
+        "attention_layouts": cache.attention_layouts,
     }
-    # JSON normalization turns tuples into lists so saved/current configs compare exactly.
     return json.loads(json.dumps(payload))
 
 
-def _load_selection_file(path: Path) -> Dict[str, Dict[int, np.ndarray]]:
+def _load_selection_file(path: Path) -> Dict[str, Dict[str, Dict[int, np.ndarray]]]:
     raw = json.loads(path.read_text(encoding="utf-8"))
     return {
-        method: {int(layer): np.asarray(indices, dtype=np.int64) for layer, indices in layer_map.items()}
-        for method, layer_map in raw.items()
+        method: {
+            unit_type: {
+                int(layer): np.asarray(indices, dtype=np.int64)
+                for layer, indices in layer_map.items()
+            }
+            for unit_type, layer_map in target_map.items()
+        }
+        for method, target_map in raw.items()
     }
 
 
-def _score_or_load(args, cache, report_dir: Path) -> Dict[str, Dict[int, np.ndarray]]:
+def _score_or_load(
+    args,
+    cache,
+    report_dir: Path,
+    targets: tuple[str, ...],
+) -> Dict[str, Dict[str, Dict[int, np.ndarray]]]:
     config = _pipeline_config(args)
-    payload = _config_payload(args, config, cache)
+    payload = _config_payload(args, config, cache, targets)
     config_path = report_dir / "score_config.json"
     indices_path = report_dir / "prune_indices.json"
 
@@ -136,59 +186,69 @@ def _score_or_load(args, cache, report_dir: Path) -> Dict[str, Dict[int, np.ndar
         band_count=config.frequency.target_bands,
         prune_step=args.paper_prune_step,
     )
-    selections: Dict[str, Dict[int, np.ndarray]] = {
-        "paper_mi": {},
-        "paper_mi_gb": {},
-        "paper_mi_gb_lcb": {},
+    selections: Dict[str, Dict[str, Dict[int, np.ndarray]]] = {
+        method: {unit_type: {} for unit_type in targets}
+        for method in METHODS
     }
 
     try:
         for layer_id in range(cache.num_layers):
             print(f"[paper scoring] layer {layer_id + 1}/{cache.num_layers}")
-            responses = np.asarray(cache.load_layer(layer_id), dtype=np.float32)
-            scores = score_layer(
-                responses,
-                cache.events,
-                cache.scenario_ids,
-                config,
-                layer_id=layer_id,
-            )
-            prune_count = resolve_prune_count(
-                scores.mi_score.size,
-                args.sparsity_ratio,
-                args.prune_per_layer,
-            )
-            layer_selections = {
-                "paper_mi": select_bottom_k(scores.mi_score, prune_count),
-                "paper_mi_gb": select_bottom_k(scores.granular_score, prune_count),
-                "paper_mi_gb_lcb": select_bottom_k(scores.lcb_score, prune_count),
-            }
-            for method, indices in layer_selections.items():
-                selections[method][layer_id] = indices
-            writer.add_layer(layer_id, scores, layer_selections)
-
-            ball_counts = [len(item.balls) for item in scores.granularities]
-            print(
-                f"  units={scores.mi_score.size}, prune={prune_count}, "
-                f"balls={ball_counts}, lcb_std_mean={scores.lcb_std.mean():.6g}"
-            )
-            if len(set(ball_counts)) == 1:
-                print("  WARNING: purity thresholds produced identical ball counts; consider lowering min_ball_size or min_event_classes.")
-            if np.allclose(scores.lcb_std, 0.0):
-                print("  WARNING: all LCB standard deviations are zero; check repeat count and scenario/event diversity.")
-            if layer_id in plot_layers:
-                plot_granular_balls(
-                    scores,
+            for target_offset, unit_type in enumerate(targets):
+                responses = np.asarray(cache.load_layer(layer_id, unit_type), dtype=np.float32)
+                scores = score_layer(
+                    responses,
                     cache.events,
-                    layer_id,
-                    report_dir / f"layer_{layer_id:03d}_balls.png",
+                    cache.scenario_ids,
+                    config,
+                    layer_id=layer_id * len(targets) + target_offset,
                 )
-                plot_lcb_scores(
-                    scores,
-                    layer_id,
-                    report_dir / f"layer_{layer_id:03d}_lcb.png",
+                ratio, exact_count = _target_budget(args, unit_type)
+                prune_count = resolve_prune_count(
+                    scores.mi_score.size,
+                    ratio,
+                    exact_count,
                 )
-            del responses, scores
+                layer_selections = {
+                    "paper_mi": select_bottom_k(scores.mi_score, prune_count),
+                    "paper_mi_gb": select_bottom_k(scores.granular_score, prune_count),
+                    "paper_mi_gb_lcb": select_bottom_k(scores.lcb_score, prune_count),
+                }
+                for method, indices in layer_selections.items():
+                    selections[method][unit_type][layer_id] = indices
+                writer.add_layer(layer_id, unit_type, scores, layer_selections)
+
+                ball_counts = [len(item.balls) for item in scores.granularities]
+                print(
+                    f"  {unit_type}: units={scores.mi_score.size}, prune={prune_count}, "
+                    f"ratio={prune_count / scores.mi_score.size:.4f}, "
+                    f"balls={ball_counts}, lcb_std_mean={scores.lcb_std.mean():.6g}"
+                )
+                if len(set(ball_counts)) == 1:
+                    print(
+                        "  WARNING: purity thresholds produced identical ball counts; "
+                        "consider lowering min_ball_size or min_event_classes."
+                    )
+                if np.allclose(scores.lcb_std, 0.0):
+                    print(
+                        "  WARNING: all LCB standard deviations are zero; "
+                        "check repeat count and scenario/event diversity."
+                    )
+                if layer_id in plot_layers:
+                    plot_granular_balls(
+                        scores,
+                        cache.events,
+                        layer_id,
+                        unit_type,
+                        report_dir / f"layer_{layer_id:03d}_{unit_type}_balls.png",
+                    )
+                    plot_lcb_scores(
+                        scores,
+                        layer_id,
+                        unit_type,
+                        report_dir / f"layer_{layer_id:03d}_{unit_type}_lcb.png",
+                    )
+                del responses, scores
     finally:
         writer.close()
 
@@ -197,9 +257,16 @@ def _score_or_load(args, cache, report_dir: Path) -> Dict[str, Dict[int, np.ndar
     return selections
 
 
-def _print_mask_overlap(selections: Mapping[str, Mapping[int, np.ndarray]]) -> None:
+def _print_mask_overlap(
+    selections: Mapping[str, Mapping[str, Mapping[int, np.ndarray]]]
+) -> None:
     def flatten(mask):
-        return {(layer, int(unit)) for layer, values in mask.items() for unit in values}
+        return {
+            (unit_type, layer, int(unit))
+            for unit_type, layer_map in mask.items()
+            for layer, values in layer_map.items()
+            for unit in values
+        }
 
     pairs = [
         ("paper_mi", "paper_mi_gb"),
@@ -216,8 +283,7 @@ def _print_mask_overlap(selections: Mapping[str, Mapping[int, np.ndarray]]) -> N
             print("  WARNING: masks are identical, so identical PPL is expected.")
 
 
-
-def _validate_cache_against_model(cache, model) -> None:
+def _validate_cache_against_model(cache, model, targets: tuple[str, ...]) -> None:
     layers = getattr(getattr(model, "model", model), "layers", None)
     if layers is None or len(layers) != cache.num_layers:
         raise ValueError(
@@ -225,19 +291,67 @@ def _validate_cache_against_model(cache, model) -> None:
             "use --paper_overwrite_cache or a model-specific --paper_cache_dir"
         )
     for layer_id, layer in enumerate(layers):
-        unit_count = int(layer.mlp.down_proj.in_features)
-        if cache.unit_counts.get(layer_id) != unit_count:
-            raise ValueError(
-                f"response cache layer {layer_id} has {cache.unit_counts.get(layer_id)} units, "
-                f"current model has {unit_count}; rebuild the cache"
+        if "mlp" in targets:
+            unit_count = int(layer.mlp.down_proj.in_features)
+            if cache.unit_counts["mlp"].get(layer_id) != unit_count:
+                raise ValueError(
+                    f"response cache layer {layer_id} has {cache.unit_counts['mlp'].get(layer_id)} MLP units, "
+                    f"current model has {unit_count}; rebuild the cache"
+                )
+        if "attention" in targets:
+            attn = layer.self_attn
+            num_heads = int(
+                getattr(attn, "num_heads", 0)
+                or getattr(model.config, "num_attention_heads", 0)
             )
+            num_kv_heads = int(
+                getattr(attn, "num_key_value_heads", 0)
+                or getattr(model.config, "num_key_value_heads", num_heads)
+            )
+            if num_heads != num_kv_heads:
+                raise ValueError(
+                    "MLP+attention structured pruning currently expects standard multi-head attention "
+                    f"with equal query/KV head counts; layer {layer_id} has {num_heads}/{num_kv_heads}."
+                )
+            if cache.unit_counts["attention"].get(layer_id) != num_heads:
+                raise ValueError(
+                    f"response cache layer {layer_id} has "
+                    f"{cache.unit_counts['attention'].get(layer_id)} attention heads, "
+                    f"current model has {num_heads}; rebuild the cache"
+                )
+
+
+def _print_applied_budget(
+    model,
+    selected: Mapping[str, Mapping[int, np.ndarray]],
+) -> None:
+    layers = getattr(getattr(model, "model", model), "layers")
+    for unit_type, layer_map in selected.items():
+        first_layer = min(layer_map) if layer_map else None
+        if first_layer is None:
+            continue
+        pruned = len(layer_map[first_layer])
+        if unit_type == "mlp":
+            total = int(layers[first_layer].mlp.down_proj.in_features)
+        else:
+            attn = layers[first_layer].self_attn
+            total = int(
+                getattr(attn, "num_heads", 0)
+                or getattr(model.config, "num_attention_heads", 0)
+            )
+        print(
+            f"applied {unit_type} structured sparsity: "
+            f"{pruned}/{total} = {pruned / total:.6f} per layer"
+        )
+
 
 def prune_paper(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
     if prune_n or prune_m:
-        raise ValueError("paper-aligned pruning supports structured MLP channels, not N:M weight sparsity")
+        raise ValueError("paper-aligned pruning supports structured units, not N:M weight sparsity")
     method = _canonical_method(args.prune_method)
-    if method not in {"paper_mi", "paper_mi_gb", "paper_mi_gb_lcb"}:
+    if method not in METHODS:
         raise ValueError(f"unsupported paper method: {args.prune_method}")
+    targets = _parse_targets(args.paper_prune_targets)
 
     cache_dir = Path(args.paper_cache_dir)
     if (cache_dir / "metadata.json").exists() and not args.paper_overwrite_cache:
@@ -262,10 +376,12 @@ def prune_paper(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
             overwrite=args.paper_overwrite_cache,
         )
 
-    _validate_cache_against_model(cache, model)
+    _validate_cache_against_model(cache, model, targets)
     report_dir = Path(args.paper_report_dir)
-    selections = _score_or_load(args, cache, report_dir)
+    selections = _score_or_load(args, cache, report_dir, targets)
     _print_mask_overlap(selections)
-    print(f"applying {method} structured MLP channel mask")
-    zero_mlp_channels_(model, selections[method])
-    return selections[method]
+    print(f"applying {method} structured masks for targets={','.join(targets)}")
+    selected = selections[method]
+    zero_structured_units_(model, selected)
+    _print_applied_budget(model, selected)
+    return selected

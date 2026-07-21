@@ -5,7 +5,8 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from lib.paper_pruning.apply import zero_mlp_channels_
+from lib.paper_pruning.apply import zero_attention_heads_, zero_mlp_channels_, zero_structured_units_
+from lib.paper_pruning.collector import collect_gradient_response_cache
 from lib.paper_pruning.config import FrequencyConfig, GranularBallConfig, LCBConfig, PipelineConfig
 from lib.paper_pruning.granular_ball import build_multigranularity_hierarchy, layer_localization_features
 from lib.paper_pruning.mi import build_frequency_spectrum
@@ -81,17 +82,41 @@ def test_three_ablation_paths_and_lcb_variance():
 
 
 class ToyMLP(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, hidden=4, intermediate=6):
         super().__init__()
-        self.gate_proj = torch.nn.Linear(4, 6, bias=True)
-        self.up_proj = torch.nn.Linear(4, 6, bias=True)
-        self.down_proj = torch.nn.Linear(6, 4, bias=False)
+        self.gate_proj = torch.nn.Linear(hidden, intermediate, bias=True)
+        self.up_proj = torch.nn.Linear(hidden, intermediate, bias=True)
+        self.down_proj = torch.nn.Linear(intermediate, hidden, bias=False)
+
+
+class ToyAttention(torch.nn.Module):
+    def __init__(self, hidden=4, num_heads=2):
+        super().__init__()
+        self.num_heads = num_heads
+        self.num_key_value_heads = num_heads
+        self.head_dim = hidden // num_heads
+        self.q_proj = torch.nn.Linear(hidden, hidden, bias=True)
+        self.k_proj = torch.nn.Linear(hidden, hidden, bias=True)
+        self.v_proj = torch.nn.Linear(hidden, hidden, bias=True)
+        self.o_proj = torch.nn.Linear(hidden, hidden, bias=False)
+
+    def forward(self, x):
+        # The collector only needs a differentiable, head-concatenated o_proj input.
+        mixed = (self.q_proj(x) + self.k_proj(x) + self.v_proj(x)) / 3
+        return self.o_proj(mixed)
 
 
 class ToyLayer(torch.nn.Module):
     def __init__(self):
         super().__init__()
+        self.self_attn = ToyAttention()
         self.mlp = ToyMLP()
+
+    def forward(self, x):
+        x = x + self.self_attn(x)
+        gate = torch.sigmoid(self.mlp.gate_proj(x))
+        up = self.mlp.up_proj(x)
+        return x + self.mlp.down_proj(gate * up)
 
 
 class ToyModel(torch.nn.Module):
@@ -100,33 +125,32 @@ class ToyModel(torch.nn.Module):
         self.model = SimpleNamespace(layers=[ToyLayer(), ToyLayer()])
 
 
-def test_structured_mlp_channel_zeroing():
+def test_structured_mlp_and_attention_zeroing():
     model = ToyModel()
-    zero_mlp_channels_(model, {0: [1, 4], 1: [2]})
-    layer0 = model.model.layers[0].mlp
-    assert torch.count_nonzero(layer0.gate_proj.weight[[1, 4]]) == 0
-    assert torch.count_nonzero(layer0.up_proj.weight[[1, 4]]) == 0
-    assert torch.count_nonzero(layer0.down_proj.weight[:, [1, 4]]) == 0
-    assert torch.count_nonzero(layer0.gate_proj.bias[[1, 4]]) == 0
+    zero_structured_units_(
+        model,
+        {
+            "mlp": {0: [1, 4], 1: [2]},
+            "attention": {0: [1], 1: [0]},
+        },
+    )
+    layer0 = model.model.layers[0]
+    assert torch.count_nonzero(layer0.mlp.gate_proj.weight[[1, 4]]) == 0
+    assert torch.count_nonzero(layer0.mlp.up_proj.weight[[1, 4]]) == 0
+    assert torch.count_nonzero(layer0.mlp.down_proj.weight[:, [1, 4]]) == 0
+    assert torch.count_nonzero(layer0.mlp.gate_proj.bias[[1, 4]]) == 0
 
-from lib.paper_pruning.collector import collect_gradient_response_cache
-
-
-class TinyBlock(torch.nn.Module):
-    def __init__(self, hidden=4, intermediate=6):
-        super().__init__()
-        self.mlp = ToyMLP()
-
-    def forward(self, x):
-        gate = torch.sigmoid(self.mlp.gate_proj(x))
-        up = self.mlp.up_proj(x)
-        return x + self.mlp.down_proj(gate * up)
+    # Head 1 corresponds to rows/columns 2:4 for hidden=4, heads=2.
+    assert torch.count_nonzero(layer0.self_attn.q_proj.weight[2:4]) == 0
+    assert torch.count_nonzero(layer0.self_attn.k_proj.weight[2:4]) == 0
+    assert torch.count_nonzero(layer0.self_attn.v_proj.weight[2:4]) == 0
+    assert torch.count_nonzero(layer0.self_attn.o_proj.weight[:, 2:4]) == 0
 
 
 class TinyBackbone(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.layers = torch.nn.ModuleList([TinyBlock(), TinyBlock()])
+        self.layers = torch.nn.ModuleList([ToyLayer(), ToyLayer()])
 
 
 class TinyCausalLM(torch.nn.Module):
@@ -135,7 +159,12 @@ class TinyCausalLM(torch.nn.Module):
         self.embed = torch.nn.Embedding(13, 4)
         self.model = TinyBackbone()
         self.lm_head = torch.nn.Linear(4, 13, bias=False)
-        self.config = SimpleNamespace(use_cache=True, _name_or_path="tiny")
+        self.config = SimpleNamespace(
+            use_cache=True,
+            _name_or_path="tiny",
+            num_attention_heads=2,
+            num_key_value_heads=2,
+        )
 
     def get_input_embeddings(self):
         return self.embed
@@ -151,7 +180,7 @@ class TinyCausalLM(torch.nn.Module):
         return SimpleNamespace(loss=loss, logits=logits)
 
 
-def test_gradient_response_collector(tmp_path):
+def test_gradient_response_collector_mlp_and_attention(tmp_path):
     model = TinyCausalLM()
     dataloader = []
     for offset in range(4):
@@ -166,6 +195,9 @@ def test_gradient_response_collector(tmp_path):
         event_bins=2,
     )
     assert cache.num_observations == 8
-    assert cache.load_layer(0).shape == (8, 6, 8)
+    assert cache.load_layer(0, "mlp").shape == (8, 6, 8)
+    assert cache.load_layer(0, "attention").shape == (8, 2, 8)
+    assert cache.unit_counts["mlp"][0] == 6
+    assert cache.unit_counts["attention"][0] == 2
     assert np.unique(cache.events).size == 2
     assert np.isfinite(cache.losses).all()

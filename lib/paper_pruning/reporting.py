@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 import json
 from pathlib import Path
-from typing import Dict, Iterable, Mapping, Optional, Sequence
+from typing import Mapping
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -29,7 +29,7 @@ class LayerReportWriter:
         self.ball_writer = csv.DictWriter(
             self.ball_file,
             fieldnames=[
-                "layer", "granularity", "purity_threshold", "ball_id", "size",
+                "unit_type", "layer", "granularity", "purity_threshold", "ball_id", "size",
                 "purity", "radius", "depth", "dominant_event",
             ],
         )
@@ -38,7 +38,7 @@ class LayerReportWriter:
 
     def _score_fields(self):
         fields = [
-            "layer", "unit", "mi_total", "granular_total", "lcb_mean", "lcb_std", "lcb_score",
+            "unit_type", "layer", "unit", "mi_total", "granular_total", "lcb_mean", "lcb_std", "lcb_score",
             "mi_pruned", "granular_pruned", "lcb_pruned",
         ]
         for band in range(self.band_count):
@@ -48,12 +48,14 @@ class LayerReportWriter:
     def add_layer(
         self,
         layer_id: int,
+        unit_type: str,
         scores: LayerAblationScores,
         selections: Mapping[str, np.ndarray],
     ) -> None:
         selected_sets = {key: set(np.asarray(value, dtype=np.int64).tolist()) for key, value in selections.items()}
         for unit in range(scores.mi_score.size):
             row = {
+                "unit_type": unit_type,
                 "layer": layer_id,
                 "unit": unit,
                 "mi_total": float(scores.mi_score[unit]),
@@ -74,6 +76,7 @@ class LayerReportWriter:
             for ball_id, ball in enumerate(granularity.balls):
                 self.ball_writer.writerow(
                     {
+                        "unit_type": unit_type,
                         "layer": layer_id,
                         "granularity": granularity_id,
                         "purity_threshold": granularity.purity_threshold,
@@ -97,6 +100,7 @@ def plot_granular_balls(
     scores: LayerAblationScores,
     events: np.ndarray,
     layer_id: int,
+    unit_type: str,
     output_path: str | Path,
     granularity_index: int = -1,
 ) -> Path:
@@ -113,7 +117,10 @@ def plot_granular_balls(
         circle = plt.Circle(center, radius, fill=False, linewidth=1.0, alpha=0.8)
         ax.add_patch(circle)
         ax.text(center[0], center[1], f"g{ball_id}\nn={ball.size}\np={ball.purity:.2f}", fontsize=7)
-    ax.set_title(f"Layer {layer_id}: local granular balls, purity={granularity.purity_threshold:.2f}")
+    ax.set_title(
+        f"Layer {layer_id} {unit_type}: local granular balls, "
+        f"purity={granularity.purity_threshold:.2f}"
+    )
     ax.set_xlabel("PCA-1")
     ax.set_ylabel("PCA-2")
     fig.colorbar(scatter, ax=ax, label="task event")
@@ -125,14 +132,19 @@ def plot_granular_balls(
     return path
 
 
-def plot_lcb_scores(scores: LayerAblationScores, layer_id: int, output_path: str | Path) -> Path:
+def plot_lcb_scores(
+    scores: LayerAblationScores,
+    layer_id: int,
+    unit_type: str,
+    output_path: str | Path,
+) -> Path:
     order = np.argsort(scores.lcb_score)
     x = np.arange(order.size)
     fig, ax = plt.subplots(figsize=(12, 5))
     ax.errorbar(x, scores.lcb_mean[order], yerr=scores.lcb_std[order], fmt=".", markersize=2, capsize=1)
     ax.plot(x, scores.lcb_score[order], linewidth=1.0, label="LCB")
-    ax.set_title(f"Layer {layer_id}: contribution mean, std and LCB")
-    ax.set_xlabel("MLP channels sorted by LCB")
+    ax.set_title(f"Layer {layer_id} {unit_type}: contribution mean, std and LCB")
+    ax.set_xlabel(f"{unit_type} units sorted by LCB")
     ax.set_ylabel("contribution")
     ax.legend()
     fig.tight_layout()
@@ -143,29 +155,43 @@ def plot_lcb_scores(scores: LayerAblationScores, layer_id: int, output_path: str
     return path
 
 
-def _flatten_mask(mask: Mapping[int, np.ndarray]):
-    return {(int(layer), int(unit)) for layer, values in mask.items() for unit in np.asarray(values)}
+def _flatten_mask(mask: Mapping[str, Mapping[int, np.ndarray]]):
+    return {
+        (unit_type, int(layer), int(unit))
+        for unit_type, layer_map in mask.items()
+        for layer, values in layer_map.items()
+        for unit in np.asarray(values)
+    }
 
 
 def write_selection_files(
     output_dir: str | Path,
-    selections: Mapping[str, Mapping[int, np.ndarray]],
+    selections: Mapping[str, Mapping[str, Mapping[int, np.ndarray]]],
     prune_step: int,
 ) -> None:
     output = Path(output_dir)
     serializable = {
-        method: {str(layer): np.asarray(indices, dtype=np.int64).tolist() for layer, indices in layer_map.items()}
-        for method, layer_map in selections.items()
+        method: {
+            unit_type: {
+                str(layer): np.asarray(indices, dtype=np.int64).tolist()
+                for layer, indices in layer_map.items()
+            }
+            for unit_type, layer_map in target_map.items()
+        }
+        for method, target_map in selections.items()
     }
     (output / "prune_indices.json").write_text(
         json.dumps(serializable, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     batches = {
         method: {
-            str(layer): [batch.tolist() for batch in split_into_steps(indices, prune_step)]
-            for layer, indices in layer_map.items()
+            unit_type: {
+                str(layer): [batch.tolist() for batch in split_into_steps(indices, prune_step)]
+                for layer, indices in layer_map.items()
+            }
+            for unit_type, layer_map in target_map.items()
         }
-        for method, layer_map in selections.items()
+        for method, target_map in selections.items()
     }
     (output / "prune_batches_step10.json").write_text(
         json.dumps(batches, ensure_ascii=False, indent=2), encoding="utf-8"

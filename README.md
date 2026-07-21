@@ -191,3 +191,50 @@ PYTHONPATH=. pytest -q tests/test_paper_pruning.py
 ```
 
 当前测试覆盖：频域互信息、纯度驱动粒球层级、三路消融差异、LCB 方差、梯度响应采集以及 MLP 通道同步置零。
+
+## Structured MLP + attention-head pruning (v3)
+
+The paper-aligned methods now treat both LLaMA MLP intermediate channels and complete attention heads as prunable structural units.
+
+- MLP response: input of `mlp.down_proj` multiplied by its task-loss gradient.
+- Attention response: input of `self_attn.o_proj`, reshaped by head, multiplied by its gradient and summed over `head_dim`.
+- MLP mask: zero matching `gate_proj`/`up_proj` rows and `down_proj` columns.
+- Attention mask: zero matching `q_proj`/`k_proj`/`v_proj` rows and `o_proj` columns.
+- Tensor shapes are preserved for PPL ablation. Physical slicing is still required for wall-clock speedup.
+
+The default paper targets are now:
+
+```text
+--paper_prune_targets mlp,attention
+```
+
+With standard Llama-2-7B attention, this command gives 50% structured sparsity in both parts:
+
+```bash
+PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 python -u run_paper_ablation.py \
+  --model /root/dw2/Lya/models/Llama-2-7b \
+  --c4_path /root/dw2/Lya/dataset/dataset_c4 \
+  --wikitext2_path /root/dw2/Lya/dataset/dataset_wikitext-raw \
+  --cache_dir /root/dw2/Lya/models/cache \
+  --output_dir results/paper_ablation_mlp_attn_s050 \
+  --sparsity_ratio 0.50 \
+  --mlp_sparsity_ratio 0.50 \
+  --attention_sparsity_ratio 0.50 \
+  --prune_per_layer 0 \
+  --attention_prune_per_layer 0 \
+  --paper_prune_targets mlp,attention \
+  --paper_score_nsamples 16 \
+  --paper_calib_seqlen 256 \
+  --paper_response_length 16 \
+  --paper_num_bins 8 \
+  --paper_num_bands 3 \
+  --paper_scenario_ratios 0.5,1.0 \
+  --paper_min_ball_size 4 \
+  --paper_max_balls 32 \
+  --n_samples_lcb 5 \
+  --overwrite
+```
+
+Old MLP-only response caches are intentionally rejected. Use a new output directory or pass `--overwrite` so attention responses are collected.
+
+The exact q/k/v/o head-mask implementation currently requires `num_attention_heads == num_key_value_heads`. This includes Llama-2-7B. Grouped-query-attention models are rejected to avoid silently applying an invalid K/V mask.
