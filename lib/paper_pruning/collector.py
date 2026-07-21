@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 
 
-CACHE_VERSION = 3
+CACHE_VERSION = 5
 UNIT_TYPES = ("mlp", "attention")
 LINEAR_MODULES = (
     "self_attn.q_proj",
@@ -33,7 +33,9 @@ class ResponseCache:
     attention_layouts: Dict[int, Dict[str, int]]
     events: np.ndarray
     scenario_ids: np.ndarray
+    base_sample_ids: np.ndarray
     losses: np.ndarray
+    position_losses: np.ndarray
     linear_modules: tuple[str, ...]
 
     def layer_path(self, layer_id: int, unit_type: str = "mlp") -> Path:
@@ -64,23 +66,20 @@ def parse_scenario_ratios(raw: str | Sequence[float]) -> List[float]:
     return sorted(set(values))
 
 
-def _quantile_events(losses: np.ndarray, scenario_ids: np.ndarray, bins: int) -> np.ndarray:
+def _quantile_events(losses: np.ndarray, bins: int) -> np.ndarray:
+    """Build a unified task-event scale from position-derived NLL scores."""
     if bins < 2:
         raise ValueError("event_bins must be >= 2")
-    labels = np.zeros(losses.size, dtype=np.int64)
-    for scenario in np.unique(scenario_ids):
-        indices = np.flatnonzero(scenario_ids == scenario)
-        values = losses[indices]
-        if indices.size < bins:
-            order = np.argsort(np.argsort(values, kind="stable"), kind="stable")
-            labels[indices] = np.minimum((order * bins) // max(1, indices.size), bins - 1)
-            continue
+    values = np.asarray(losses, dtype=np.float64)
+    if values.size < bins:
+        order = np.argsort(np.argsort(values, kind="stable"), kind="stable")
+        labels = np.minimum((order * bins) // max(1, values.size), bins - 1)
+    else:
         quantiles = np.quantile(values, np.linspace(0, 1, bins + 1)[1:-1])
-        edges = np.unique(quantiles)
-        labels[indices] = np.digitize(values, edges, right=False)
+        labels = np.digitize(values, np.unique(quantiles), right=False)
+    labels = labels.astype(np.int64, copy=False)
     if np.unique(labels).size < 2:
-        median = float(np.median(losses))
-        labels = (losses > median).astype(np.int64)
+        labels = (values > float(np.median(values))).astype(np.int64)
     if np.unique(labels).size < 2:
         labels[np.arange(labels.size) % 2 == 1] = 1
     return labels
@@ -152,7 +151,9 @@ def load_response_cache(cache_dir: str | Path) -> ResponseCache:
         )
     events = np.load(root / "events.npy")
     scenarios = np.load(root / "scenario_ids.npy")
+    base_sample_ids = np.load(root / "base_sample_ids.npy")
     losses = np.load(root / "losses.npy")
+    position_losses = np.load(root / "position_losses.npy")
     raw_counts = metadata["unit_counts"]
     unit_counts = {
         unit_type: {int(key): int(value) for key, value in layer_map.items()}
@@ -171,7 +172,9 @@ def load_response_cache(cache_dir: str | Path) -> ResponseCache:
         attention_layouts=attention_layouts,
         events=events,
         scenario_ids=scenarios,
+        base_sample_ids=base_sample_ids,
         losses=losses,
+        position_losses=position_losses,
         linear_modules=tuple(metadata.get("linear_modules", LINEAR_MODULES)),
     )
     for unit_type in UNIT_TYPES:
@@ -196,14 +199,10 @@ def collect_gradient_response_cache(
 ) -> ResponseCache:
     """Collect task-gradient responses for MLP channels and attention heads.
 
-    MLP channel response:
-        ``r_i(t) = z_i(t) * dL/dz_i(t)`` at the input of ``mlp.down_proj``.
-
-    Attention-head response:
-        ``r_h(t) = sum_d z_h,d(t) * dL/dz_h,d(t)`` at the input of
-        ``self_attn.o_proj``. Summation over the head dimension turns a complete
-        attention head into one structured unit while preserving sequence
-        position for the later DCT/MI pipeline.
+    MLP channel response follows the detailed proposal: the absolute task-loss
+    gradient with respect to the FFN intermediate activation. Attention response
+    is the L2 norm of the task-loss gradient over each head feature dimension.
+    Both retain sequence position for the later standardization and DCT.
     """
     root = Path(cache_dir)
     metadata_path = root / "metadata.json"
@@ -261,7 +260,9 @@ def collect_gradient_response_cache(
             activation_counts[layer_id][module_name] = 0
 
     losses = np.zeros(observations, dtype=np.float64)
+    position_losses = np.zeros((observations, response_length), dtype=np.float32)
     scenario_ids = np.zeros(observations, dtype=np.int64)
+    base_sample_ids = np.zeros(observations, dtype=np.int64)
     written = {
         unit_type: np.zeros((observations, num_layers), dtype=bool)
         for unit_type in UNIT_TYPES
@@ -318,7 +319,7 @@ def collect_gradient_response_cache(
             layer.mlp.down_proj,
             layer_id,
             "mlp",
-            lambda activation, gradient: (activation * gradient).transpose(1, 2),
+            lambda activation, gradient: gradient.abs().transpose(1, 2),
         )
         layout = attention_layouts[layer_id]
         num_heads = layout["num_heads"]
@@ -329,8 +330,9 @@ def collect_gradient_response_cache(
                 raise ValueError(
                     f"o_proj input width {activation.shape[-1]} does not match {h} heads x {d}"
                 )
-            response = (activation * gradient).reshape(activation.shape[0], activation.shape[1], h, d)
-            return response.sum(dim=-1).transpose(1, 2)
+            del activation
+            response = gradient.reshape(gradient.shape[0], gradient.shape[1], h, d)
+            return torch.linalg.vector_norm(response, ord=2, dim=-1).transpose(1, 2)
 
         register_response_hook(
             layer.self_attn.o_proj,
@@ -373,8 +375,20 @@ def collect_gradient_response_cache(
                 model.zero_grad(set_to_none=True)
                 outputs = model(input_ids=input_ids, labels=input_ids, use_cache=False)
                 loss = outputs.loss
-                losses[row] = float(loss.detach().cpu())
+                shift_logits = outputs.logits[:, :-1, :].float().contiguous()
+                shift_labels = input_ids[:, 1:].contiguous()
+                token_nll = F.cross_entropy(
+                    shift_logits.reshape(-1, shift_logits.shape[-1]),
+                    shift_labels.reshape(-1),
+                    reduction="none",
+                ).reshape(shift_labels.shape)
+                pooled_nll = F.adaptive_avg_pool1d(
+                    token_nll.unsqueeze(1), response_length
+                ).squeeze(1).mean(dim=0)
+                position_losses[row] = pooled_nll.detach().cpu().numpy().astype(np.float32)
+                losses[row] = float(token_nll.mean().detach().cpu())
                 scenario_ids[row] = scenario_id
+                base_sample_ids[row] = sample_index
                 loss.backward()
                 for unit_type in UNIT_TYPES:
                     if not written[unit_type][row].all():
@@ -382,7 +396,7 @@ def collect_gradient_response_cache(
                         raise RuntimeError(
                             f"{unit_type} gradient response missing for layers {missing} at observation {row}"
                         )
-                del outputs, loss, input_ids
+                del outputs, loss, input_ids, shift_logits, shift_labels, token_nll, pooled_nll
                 row += 1
                 print(f"[paper response] observation {row}/{observations}", flush=True)
                 if torch.cuda.is_available() and row % 8 == 0:
@@ -411,10 +425,12 @@ def collect_gradient_response_cache(
                 root / f"layer_{layer_id:03d}_{safe_name}_input_scale.npy",
                 mean_square.astype(np.float32, copy=False),
             )
-    events = _quantile_events(losses, scenario_ids, event_bins)
+    events = _quantile_events(losses, event_bins)
     np.save(root / "events.npy", events)
     np.save(root / "scenario_ids.npy", scenario_ids)
+    np.save(root / "base_sample_ids.npy", base_sample_ids)
     np.save(root / "losses.npy", losses)
+    np.save(root / "position_losses.npy", position_losses)
     metadata = {
         "cache_version": CACHE_VERSION,
         "num_observations": observations,
@@ -431,10 +447,11 @@ def collect_gradient_response_cache(
         "scenario_ratios": ratios,
         "event_bins": event_bins,
         "response_definitions": {
-            "mlp": "down_proj_input * d(causal_lm_loss)/d(down_proj_input)",
-            "attention": "sum_head_dim(o_proj_input * d(causal_lm_loss)/d(o_proj_input))",
+            "mlp": "abs(d(causal_lm_loss)/d(down_proj_input))",
+            "attention": "l2_head_dim(d(causal_lm_loss)/d(o_proj_input))",
         },
-        "activation_scale_definition": "mean over calibration tokens of linear-module input squared",
+        "task_event_definition": "global quantile bins of mean position-level next-token NLL",
+        "activation_scale_definition": "legacy diagnostic mean over calibration tokens of linear-module input squared",
     }
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     return load_response_cache(root)

@@ -16,19 +16,23 @@ from .paper_pruning.collector import (
     load_response_cache,
 )
 from .paper_pruning.config import (
+    BudgetConfig,
     FrequencyConfig,
     GranularBallConfig,
     LCBConfig,
     PipelineConfig,
 )
+from .paper_pruning.budget import coverage_aware_keep_indices
 from .paper_pruning.pipeline import score_layer
 from .paper_pruning.reporting import (
     LayerReportWriter,
     plot_granular_balls,
+    plot_unit_local_granular_balls,
     plot_lcb_scores,
     write_selection_files,
 )
 from .paper_pruning.selection import resolve_prune_count, select_bottom_k
+from .paper_pruning.wanda_sequential import apply_sequential_paper_wanda_masks_
 from .paper_pruning.wanda_weight import (
     ALL_LINEAR_MODULES,
     apply_paper_wanda_weight_masks_,
@@ -95,24 +99,36 @@ def _pipeline_config(args) -> PipelineConfig:
             fine_bins=fine_bins,
             target_bands=target_bands,
             mi_neighbors=args.paper_mi_neighbors,
+            probe_units=args.paper_probe_units,
+            kde_bandwidth_scale=args.paper_kde_bandwidth_scale,
             random_state=args.seed,
         ),
         granular_ball=GranularBallConfig(
             purity_thresholds=_parse_float_tuple(args.paper_purity_thresholds),
             min_ball_size=args.paper_min_ball_size,
             max_balls=args.paper_max_balls,
+            max_depth=args.paper_max_ball_depth,
             min_purity_gain=args.paper_min_purity_gain,
             min_radius_reduction=args.paper_min_radius_reduction,
             compactness_ratio=args.paper_compactness_ratio,
             min_event_classes=args.paper_min_event_classes,
+            localization_mode=args.paper_gb_localization,
+            workers=args.paper_gb_workers,
             random_state=args.seed,
         ),
         lcb=LCBConfig(
             repeats=args.n_samples_lcb,
             sample_fraction=args.paper_sample_fraction,
+            scenario_fraction=args.paper_scenario_fraction,
             lcb_lambda=args.lcb_lambda,
             stratify_by_scenario=True,
+            cluster_by_base_sample=True,
             random_state=args.seed,
+        ),
+        budget=BudgetConfig(
+            coverage_ratio=args.paper_band_coverage_ratio,
+            coverage_alpha=args.paper_coverage_alpha,
+            greedy_batches=args.paper_greedy_batches,
         ),
     )
 
@@ -145,7 +161,10 @@ def _config_payload(args, config: PipelineConfig, cache, targets: tuple[str, ...
         "prune_step": int(args.paper_prune_step),
         "mask_style": args.paper_mask_style,
         "wanda_weight": {
-            "score_floor": float(args.paper_wanda_score_floor),
+            "sequential": bool(args.paper_wanda_sequential),
+            "calibration_nsamples": int(args.paper_wanda_nsamples),
+            "calibration_seqlen": int(args.paper_wanda_seqlen),
+            "guidance_strength": float(args.paper_wanda_guidance_strength),
             "row_spread": float(args.paper_wanda_row_spread),
             "temperature": float(args.paper_wanda_temperature),
             "chunk_rows": int(args.paper_wanda_chunk_rows),
@@ -245,6 +264,7 @@ def _score_or_load(
                     cache.scenario_ids,
                     config,
                     layer_id=layer_id * len(targets) + target_offset,
+                    base_sample_ids=cache.base_sample_ids,
                 )
                 ratio, exact_count = _target_budget(args, unit_type)
                 prune_count = resolve_prune_count(
@@ -253,16 +273,38 @@ def _score_or_load(
                     exact_count,
                 )
                 layer_score_vectors = {
-                    "paper_mi": np.asarray(scores.mi_score, dtype=np.float32),
-                    "paper_mi_gb": np.asarray(scores.granular_score, dtype=np.float32),
-                    "paper_mi_gb_lcb": np.asarray(scores.lcb_score, dtype=np.float32),
+                    "paper_mi": np.asarray(scores.mi_score, dtype=np.float64),
+                    "paper_mi_gb": np.asarray(scores.granular_score, dtype=np.float64),
+                    "paper_mi_gb_lcb": np.asarray(scores.lcb_score, dtype=np.float64),
                 }
-                layer_selections = {
-                    method: select_bottom_k(values, prune_count)
-                    for method, values in layer_score_vectors.items()
+                layer_band_vectors = {
+                    "paper_mi": np.asarray(scores.global_spectrum.band_mi, dtype=np.float64),
+                    "paper_mi_gb": np.asarray(scores.granular_band_mi, dtype=np.float64),
+                    "paper_mi_gb_lcb": np.asarray(
+                        scores.lcb_band_mean - config.lcb.lcb_lambda * scores.lcb_band_std,
+                        dtype=np.float64,
+                    ),
                 }
-                for method, values in layer_score_vectors.items():
-                    unit_scores[method][unit_type][layer_id] = values.copy()
+                keep_count = scores.mi_score.size - prune_count
+                layer_selections = {}
+                coverage_text = []
+                for method in METHODS:
+                    keep, priority, achieved = coverage_aware_keep_indices(
+                        layer_score_vectors[method],
+                        layer_band_vectors[method],
+                        keep_count,
+                        config.budget,
+                    )
+                    prune = np.setdiff1d(
+                        np.arange(scores.mi_score.size, dtype=np.int64), keep,
+                        assume_unique=True,
+                    )
+                    layer_selections[method] = prune
+                    unit_scores[method][unit_type][layer_id] = priority.astype(np.float32)
+                    coverage_text.append(
+                        f"{method.split('paper_')[-1]}="
+                        + "/".join(f"{value:.2f}" for value in achieved)
+                    )
                 for method, indices in layer_selections.items():
                     selections[method][unit_type][layer_id] = indices
                 writer.add_layer(layer_id, unit_type, scores, layer_selections)
@@ -271,7 +313,8 @@ def _score_or_load(
                 print(
                     f"  {unit_type}: units={scores.mi_score.size}, prune={prune_count}, "
                     f"ratio={prune_count / scores.mi_score.size:.4f}, "
-                    f"balls={ball_counts}, lcb_std_mean={scores.lcb_std.mean():.6g}"
+                    f"balls={ball_counts}, lcb_std_mean={scores.lcb_std.mean():.6g}, "
+                    f"coverage=[{'; '.join(coverage_text)}]"
                 )
                 if len(set(ball_counts)) == 1:
                     print(
@@ -289,8 +332,24 @@ def _score_or_load(
                         cache.events,
                         layer_id,
                         unit_type,
-                        report_dir / f"layer_{layer_id:03d}_{unit_type}_balls.png",
+                        report_dir / f"layer_{layer_id:03d}_{unit_type}_balls_diagnostic.png",
                     )
+                    if config.granular_ball.localization_mode == "unit_local":
+                        order = np.argsort(scores.lcb_score, kind="stable")
+                        representative = {
+                            "low": int(order[0]),
+                            "boundary": int(order[min(prune_count, order.size - 1)]),
+                            "high": int(order[-1]),
+                        }
+                        for label, unit_id in representative.items():
+                            plot_unit_local_granular_balls(
+                                scores, cache.events, layer_id, unit_type, unit_id,
+                                config.granular_ball,
+                                report_dir / (
+                                    f"layer_{layer_id:03d}_{unit_type}_unit_{unit_id:05d}_"
+                                    f"{label}_local_balls.png"
+                                ),
+                            )
                     plot_lcb_scores(
                         scores,
                         layer_id,
@@ -369,7 +428,7 @@ def _validate_cache_against_model(args, cache, model, targets: tuple[str, ...]) 
                     f"{cache.unit_counts['attention'].get(layer_id)} attention heads, "
                     f"current model has {num_heads}; rebuild the cache"
                 )
-    if args.paper_mask_style == "wanda_weight":
+    if args.paper_mask_style == "wanda_weight" and not args.paper_wanda_sequential:
         required = set()
         if "attention" in targets:
             required.update(name for name in ALL_LINEAR_MODULES if name.startswith("self_attn."))
@@ -458,18 +517,37 @@ def prune_paper(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
         f"applying {method} paper-guided Wanda weight masks for targets={','.join(targets)}; "
         f"mlp_ratio={mlp_ratio:.4f}, attention_ratio={attention_ratio:.4f}"
     )
-    summaries = apply_paper_wanda_weight_masks_(
-        model,
-        unit_scores[method],
-        cache,
-        targets,
-        mlp_ratio=mlp_ratio,
-        attention_ratio=attention_ratio,
-        score_floor=args.paper_wanda_score_floor,
-        row_spread=args.paper_wanda_row_spread,
-        temperature=args.paper_wanda_temperature,
-        chunk_rows=args.paper_wanda_chunk_rows,
-    )
+    if args.paper_wanda_sequential:
+        summaries = apply_sequential_paper_wanda_masks_(
+            model,
+            tokenizer,
+            unit_scores[method],
+            targets,
+            mlp_ratio=mlp_ratio,
+            attention_ratio=attention_ratio,
+            calib_dataset=args.paper_calib_dataset,
+            nsamples=args.paper_wanda_nsamples,
+            seqlen=args.paper_wanda_seqlen,
+            seed=args.seed,
+            row_spread=args.paper_wanda_row_spread,
+            row_temperature=args.paper_wanda_temperature,
+            guidance_strength=args.paper_wanda_guidance_strength,
+            chunk_rows=args.paper_wanda_chunk_rows,
+        )
+    else:
+        summaries = apply_paper_wanda_weight_masks_(
+            model,
+            unit_scores[method],
+            cache,
+            targets,
+            mlp_ratio=mlp_ratio,
+            attention_ratio=attention_ratio,
+            score_floor=args.paper_wanda_score_floor,
+            row_spread=args.paper_wanda_row_spread,
+            temperature=args.paper_wanda_temperature,
+            guidance_strength=args.paper_wanda_guidance_strength,
+            chunk_rows=args.paper_wanda_chunk_rows,
+        )
     summary_path = report_dir / f"weight_mask_summary_{method}.csv"
     write_weight_mask_summary(summary_path, summaries)
     print(f"saved Wanda-style weight mask summary: {summary_path}")

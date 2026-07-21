@@ -79,6 +79,10 @@ def main() -> None:
             "--paper_report_dir", str(report_dir),
             "--save", str(logs_dir),
         ]
+        if args.c4_path:
+            command.extend(["--c4_path", args.c4_path])
+        if args.wikitext2_path:
+            command.extend(["--wikitext2_path", args.wikitext2_path])
         if args.overwrite and index == 0:
             command.extend(["--paper_overwrite_cache", "--paper_overwrite_scores"])
         command.extend(passthrough)

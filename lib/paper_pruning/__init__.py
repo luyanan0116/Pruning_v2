@@ -1,10 +1,11 @@
-"""Paper-aligned structured pruning for Llama/Mistral MLP channels."""
+"""Frequency-MI, granular-ball, LCB and budget-aware pruning utilities."""
 
-from .config import FrequencyConfig, GranularBallConfig, LCBConfig, PipelineConfig
+from .config import BudgetConfig, FrequencyConfig, GranularBallConfig, LCBConfig, PipelineConfig
 from .pipeline import LayerAblationScores, score_layer
 from .selection import resolve_prune_count, select_bottom_k, split_into_steps
 
 __all__ = [
+    "BudgetConfig",
     "FrequencyConfig",
     "GranularBallConfig",
     "LCBConfig",

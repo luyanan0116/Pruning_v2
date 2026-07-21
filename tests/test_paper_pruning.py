@@ -295,3 +295,80 @@ def test_paper_scores_change_wanda_weight_masks():
                 a, b = getattr(a, part), getattr(b, part)
             differences += int(torch.count_nonzero((a.weight == 0) != (b.weight == 0)).item())
     assert differences > 0
+
+
+def test_dual_source_bootstrap_preserves_valid_event_support():
+    from lib.paper_pruning.resampling import dual_source_bootstrap_indices
+
+    base = np.repeat(np.arange(12), 3)
+    scenario = np.tile(np.arange(3), 12)
+    events = (base % 3).astype(np.int64)
+    indices = dual_source_bootstrap_indices(
+        events,
+        base,
+        scenario,
+        sample_fraction=0.75,
+        scenario_fraction=2 / 3,
+        rng=np.random.default_rng(42),
+    )
+    assert indices.ndim == 1
+    assert indices.size >= 2
+    classes, counts = np.unique(events[indices], return_counts=True)
+    assert classes.size >= 2
+    assert counts.min() >= 2
+
+
+def test_coverage_aware_budget_is_exact():
+    from lib.paper_pruning.budget import coverage_aware_keep_indices
+    from lib.paper_pruning.config import BudgetConfig
+
+    scores = np.linspace(0.0, 1.0, 20)
+    bands = np.zeros((20, 3), dtype=np.float64)
+    bands[:7, 0] = 1.0
+    bands[7:14, 1] = 1.0
+    bands[14:, 2] = 1.0
+    keep, priority, achieved = coverage_aware_keep_indices(
+        scores,
+        bands,
+        keep_count=10,
+        cfg=BudgetConfig(coverage_ratio=0.5, coverage_alpha=1.0, greedy_batches=10),
+    )
+    assert keep.size == 10
+    assert priority.shape == (20,)
+    assert achieved.shape == (3,)
+    assert np.isfinite(priority).all()
+    assert np.all(achieved > 0)
+
+
+def test_gentle_guidance_stays_close_to_wanda():
+    from lib.paper_pruning.wanda_weight import centered_rank_factor
+
+    factors = centered_rank_factor(np.arange(100), strength=0.01)
+    assert factors.min() > 0.989
+    assert factors.max() < 1.011
+    assert np.isclose(np.median(factors), 1.0, atol=2e-3)
+
+
+def test_zero_guidance_and_zero_spread_matches_fixed_row_wanda():
+    from lib.paper_pruning.wanda_weight import apply_guided_wanda_module_
+
+    torch.manual_seed(11)
+    module = torch.nn.Linear(12, 8, bias=False)
+    scaler = torch.linspace(0.5, 1.5, 12)
+    original = module.weight.detach().clone()
+    metric = original.abs().float() * torch.sqrt(scaler.float()).unsqueeze(0)
+    expected = torch.zeros_like(metric, dtype=torch.bool)
+    expected.scatter_(1, torch.topk(metric, 6, dim=1, largest=False).indices, True)
+
+    apply_guided_wanda_module_(
+        "mlp.gate_proj",
+        module,
+        scaler,
+        unit_scores=np.arange(8, dtype=np.float32),
+        ratio=0.5,
+        head_dim=1,
+        row_spread=0.0,
+        guidance_strength=0.0,
+        chunk_rows=3,
+    )
+    assert torch.equal(module.weight == 0, expected)

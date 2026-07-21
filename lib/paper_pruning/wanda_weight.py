@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import csv
 from pathlib import Path
-from typing import Dict, Mapping
+from typing import Mapping
 
 import numpy as np
 import torch
@@ -37,25 +37,39 @@ def get_submodule(root: torch.nn.Module, dotted_name: str) -> torch.nn.Module:
     return module
 
 
-def rank_normalize(scores: np.ndarray, floor: float = 0.05) -> np.ndarray:
-    """Map arbitrary contribution scores to a stable positive rank factor.
-
-    Low-contribution units receive ``floor`` and high-contribution units receive
-    1.0. Rank normalization is used because MI, local MI and LCB can have
-    different numeric scales and LCB values may be negative.
-    """
+def _rank01(scores: np.ndarray) -> np.ndarray:
     values = np.asarray(scores, dtype=np.float64).reshape(-1)
     if values.size == 0:
         raise ValueError("scores must be non-empty")
-    if not 0 < floor <= 1:
-        raise ValueError("score floor must be in (0,1]")
-    order = np.argsort(values, kind="stable")
+    finite = np.nan_to_num(values, nan=-np.inf, neginf=-np.inf, posinf=np.inf)
+    order = np.argsort(finite, kind="stable")
     ranks = np.empty(values.size, dtype=np.float64)
     if values.size == 1:
-        ranks[order] = 1.0
+        ranks[order] = 0.5
     else:
         ranks[order] = np.linspace(0.0, 1.0, values.size)
+    return ranks
+
+
+def rank_normalize(scores: np.ndarray, floor: float = 0.05) -> np.ndarray:
+    """Legacy [floor,1] rank map retained for compatibility."""
+    if not 0 < floor <= 1:
+        raise ValueError("score floor must be in (0,1]")
+    ranks = _rank01(scores)
     return (floor + (1.0 - floor) * ranks).astype(np.float32)
+
+
+def centered_rank_factor(scores: np.ndarray, strength: float = 0.01) -> np.ndarray:
+    """Near-one multiplicative guidance that preserves Wanda's base metric.
+
+    At the recommended strength 0.01, factors lie in approximately
+    [0.990, 1.010]. This is deliberately much gentler than the v4 [0.05, 1]
+    multiplier, which could overwhelm Wanda and caused high PPL.
+    """
+    if strength < 0:
+        raise ValueError("guidance strength must be non-negative")
+    centered = 2.0 * _rank01(scores) - 1.0
+    return np.exp(strength * centered).astype(np.float32)
 
 
 def _row_sparsities(
@@ -73,22 +87,10 @@ def _row_sparsities(
         raise ValueError("row spread must be in [0,1)")
     if temperature <= 0:
         raise ValueError("temperature must be positive")
-
-    values = np.asarray(scores, dtype=np.float64).reshape(-1)
-    order = np.argsort(values, kind="stable")
-    percentile = np.empty(values.size, dtype=np.float64)
-    if values.size == 1:
-        percentile[order] = 0.5
-    else:
-        percentile[order] = np.linspace(0.0, 1.0, values.size)
-
-    # Low-contribution units have percentile close to zero and therefore get
-    # a larger pruning weight. High-contribution units are protected.
+    percentile = _rank01(scores)
     weights = np.exp(-temperature * percentile)
     lower = max(0.0, target_ratio * (1.0 - spread))
     upper = min(0.999, target_ratio * (1.0 + spread))
-    if lower > target_ratio or upper < target_ratio:
-        lower, upper = 0.0, 0.999
 
     lo, hi = 0.0, 1000.0
     for _ in range(80):
@@ -107,21 +109,12 @@ def allocate_row_prune_counts(
     rows_per_unit: int,
     columns: int,
     target_ratio: float,
-    spread: float = 0.8,
-    temperature: float = 2.0,
+    spread: float = 0.01,
+    temperature: float = 1.0,
 ) -> np.ndarray:
-    """Allocate an exact matrix-level budget across output rows.
-
-    Wanda normally removes the same number of weights from every output row.
-    Here the total budget is unchanged, but lower-contribution structural units
-    receive more row-wise sparsity and higher-contribution units receive less.
-    """
+    """Redistribute only a small part of the row budget across units."""
     row_sparsity = _row_sparsities(
-        scores,
-        rows_per_unit=rows_per_unit,
-        target_ratio=target_ratio,
-        spread=spread,
-        temperature=temperature,
+        scores, rows_per_unit, target_ratio, spread, temperature
     )
     raw = row_sparsity * int(columns)
     counts = np.floor(raw).astype(np.int64)
@@ -147,8 +140,6 @@ def allocate_row_prune_counts(
                 counts[index] -= 1
                 residual += 1
 
-    # The clipping limits can make a single pass insufficient only for unusual
-    # parameter combinations. Finish deterministically if needed.
     cursor = 0
     while residual != 0 and counts.size:
         index = cursor % counts.size
@@ -160,41 +151,41 @@ def allocate_row_prune_counts(
             residual += 1
         cursor += 1
         if cursor > counts.size * columns * 2:
-            raise RuntimeError("unable to allocate the requested row pruning budget")
+            raise RuntimeError("unable to allocate requested row budget")
     return counts
 
 
-def _mask_rows_variable_k_(
+def _mask_from_metric_variable_k_(
     weight: torch.Tensor,
-    input_scale: torch.Tensor,
+    metric: torch.Tensor,
     row_counts: np.ndarray,
     chunk_rows: int,
 ) -> None:
-    rows, columns = weight.shape
-    if len(row_counts) != rows:
-        raise ValueError(f"row count length {len(row_counts)} does not match weight rows {rows}")
-    sqrt_scale = torch.sqrt(torch.clamp(input_scale.float(), min=1e-12))
-    if sqrt_scale.numel() != columns:
-        raise ValueError("activation scale width does not match matrix input dimension")
-
+    rows, _columns = weight.shape
     for start in range(0, rows, chunk_rows):
         end = min(rows, start + chunk_rows)
-        local_counts = torch.as_tensor(row_counts[start:end], device=weight.device, dtype=torch.long)
+        local_counts = torch.as_tensor(
+            row_counts[start:end], device=weight.device, dtype=torch.long
+        )
         max_k = int(local_counts.max().item()) if local_counts.numel() else 0
         if max_k <= 0:
             continue
-        metric = weight[start:end].detach().float().abs() * sqrt_scale.unsqueeze(0)
-        indices = torch.topk(metric, k=max_k, dim=1, largest=False, sorted=True).indices
-        valid = torch.arange(max_k, device=weight.device).unsqueeze(0) < local_counts.unsqueeze(1)
-        local_rows = torch.arange(end - start, device=weight.device).unsqueeze(1).expand_as(indices)
+        indices = torch.topk(
+            metric[start:end], k=max_k, dim=1, largest=False, sorted=True
+        ).indices
+        valid = (
+            torch.arange(max_k, device=weight.device).unsqueeze(0)
+            < local_counts.unsqueeze(1)
+        )
+        local_rows = torch.arange(
+            end - start, device=weight.device
+        ).unsqueeze(1).expand_as(indices)
         weight[start:end][local_rows[valid], indices[valid]] = 0
-        del metric, indices, valid, local_rows
 
 
-def _mask_rows_fixed_k_with_column_factor_(
+def _mask_from_metric_fixed_k_(
     weight: torch.Tensor,
-    input_scale: torch.Tensor,
-    column_factor: np.ndarray,
+    metric: torch.Tensor,
     ratio: float,
     chunk_rows: int,
 ) -> None:
@@ -203,31 +194,94 @@ def _mask_rows_fixed_k_with_column_factor_(
     if k <= 0:
         return
     if k >= columns:
-        raise ValueError("ratio would prune every input weight in an output row")
-    sqrt_scale = torch.sqrt(torch.clamp(input_scale.float(), min=1e-12))
-    factor = torch.as_tensor(column_factor, device=weight.device, dtype=torch.float32)
-    if sqrt_scale.numel() != columns or factor.numel() != columns:
-        raise ValueError("activation scale or contribution factor width mismatch")
-    combined = sqrt_scale * factor
+        raise ValueError("ratio would prune every weight in an output row")
     for start in range(0, rows, chunk_rows):
         end = min(rows, start + chunk_rows)
-        metric = weight[start:end].detach().float().abs() * combined.unsqueeze(0)
-        indices = torch.topk(metric, k=k, dim=1, largest=False, sorted=False).indices
-        local_rows = torch.arange(end - start, device=weight.device).unsqueeze(1).expand_as(indices)
+        indices = torch.topk(
+            metric[start:end], k=k, dim=1, largest=False, sorted=False
+        ).indices
+        local_rows = torch.arange(
+            end - start, device=weight.device
+        ).unsqueeze(1).expand_as(indices)
         weight[start:end][local_rows, indices] = 0
-        del metric, indices, local_rows
-
-
-def _expanded_head_factor(scores: np.ndarray, head_dim: int, floor: float) -> np.ndarray:
-    return np.repeat(rank_normalize(scores, floor=floor), int(head_dim))
 
 
 def _module_orientation(module_name: str) -> str:
-    if module_name in {"mlp.gate_proj", "mlp.up_proj", "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"}:
+    if module_name in {
+        "mlp.gate_proj", "mlp.up_proj", "self_attn.q_proj",
+        "self_attn.k_proj", "self_attn.v_proj",
+    }:
         return "rows"
     if module_name in {"mlp.down_proj", "self_attn.o_proj"}:
         return "columns"
     raise ValueError(f"unsupported module: {module_name}")
+
+
+def apply_guided_wanda_module_(
+    module_name: str,
+    module: torch.nn.Module,
+    input_scale: torch.Tensor,
+    unit_scores: np.ndarray,
+    ratio: float,
+    head_dim: int,
+    row_spread: float = 0.01,
+    row_temperature: float = 1.0,
+    guidance_strength: float = 0.01,
+    chunk_rows: int = 256,
+) -> dict:
+    """Apply one exact-budget Wanda mask with gentle paper-score guidance."""
+    weight = module.weight.data
+    before_zero = int((weight == 0).sum().item())
+    scale = torch.sqrt(torch.clamp(input_scale.float(), min=1e-12))
+    if scale.numel() != weight.shape[1]:
+        raise ValueError(
+            f"{module_name}: activation scale {scale.numel()} != input width {weight.shape[1]}"
+        )
+    metric = weight.detach().float().abs() * scale.unsqueeze(0)
+    orientation = _module_orientation(module_name)
+
+    if module_name.startswith("mlp."):
+        rows_per_unit = 1
+    else:
+        rows_per_unit = int(head_dim)
+
+    if orientation == "rows":
+        row_counts = allocate_row_prune_counts(
+            unit_scores,
+            rows_per_unit=rows_per_unit,
+            columns=weight.shape[1],
+            target_ratio=ratio,
+            spread=row_spread,
+            temperature=row_temperature,
+        )
+        if row_counts.size != weight.shape[0]:
+            raise ValueError(
+                f"{module_name}: score expansion {row_counts.size} != rows {weight.shape[0]}"
+            )
+        _mask_from_metric_variable_k_(weight, metric, row_counts, chunk_rows)
+    else:
+        factor = centered_rank_factor(unit_scores, guidance_strength)
+        if module_name == "self_attn.o_proj":
+            factor = np.repeat(factor, int(head_dim))
+        if factor.size != weight.shape[1]:
+            raise ValueError(
+                f"{module_name}: contribution factor {factor.size} != columns {weight.shape[1]}"
+            )
+        metric = metric * torch.as_tensor(
+            factor, device=metric.device, dtype=metric.dtype
+        ).unsqueeze(0)
+        _mask_from_metric_fixed_k_(weight, metric, ratio, chunk_rows)
+
+    after_zero = int((weight == 0).sum().item())
+    return {
+        "module": module_name,
+        "rows": int(weight.shape[0]),
+        "columns": int(weight.shape[1]),
+        "target_ratio": float(ratio),
+        "zeros_before": before_zero,
+        "zeros_after": after_zero,
+        "actual_ratio": after_zero / weight.numel(),
+    }
 
 
 def apply_paper_wanda_weight_masks_(
@@ -238,21 +292,15 @@ def apply_paper_wanda_weight_masks_(
     mlp_ratio: float,
     attention_ratio: float,
     score_floor: float = 0.05,
-    row_spread: float = 0.8,
-    temperature: float = 2.0,
+    row_spread: float = 0.01,
+    temperature: float = 1.0,
+    guidance_strength: float = 0.05,
     chunk_rows: int = 256,
 ) -> list[dict]:
-    """Apply paper-guided Wanda-style unstructured masks to all chosen linears.
-
-    The base importance is Wanda's ``|W| * sqrt(E[x^2])``. MI, granular-ball
-    or LCB contribution scores then steer where the fixed per-matrix weight
-    budget lands. No complete MLP channel or attention head is forced to zero.
-    """
-    if chunk_rows <= 0:
-        raise ValueError("chunk_rows must be positive")
+    """Legacy non-sequential application; sequential mode is recommended."""
+    del score_floor
     layers = transformer_layers(model)
     summaries: list[dict] = []
-
     with torch.no_grad():
         for layer_id, layer in enumerate(layers):
             layout = response_cache.attention_layouts[layer_id]
@@ -260,81 +308,35 @@ def apply_paper_wanda_weight_masks_(
             num_kv_heads = int(layout["num_key_value_heads"])
             head_dim = int(layout["head_dim"])
             if "attention" in targets and num_heads != num_kv_heads:
-                raise ValueError(
-                    "paper-guided Wanda masking currently expects equal query and KV head counts; "
-                    f"layer {layer_id} has {num_heads}/{num_kv_heads}"
-                )
-
+                raise ValueError("guided attention masking currently expects MHA")
             module_names = []
             if "attention" in targets:
                 module_names.extend(ATTENTION_MODULES)
             if "mlp" in targets:
                 module_names.extend(MLP_MODULES)
-
             for module_name in module_names:
                 module = get_submodule(layer, module_name)
-                weight = module.weight.data
-                before_zero = int((weight == 0).sum().item())
-                input_scale_np = response_cache.load_activation_scale(layer_id, module_name)
-                input_scale = torch.as_tensor(input_scale_np, device=weight.device, dtype=torch.float32)
-                orientation = _module_orientation(module_name)
-
-                if module_name.startswith("mlp."):
-                    unit_scores = np.asarray(scores_by_type["mlp"][layer_id], dtype=np.float32)
-                    ratio = float(mlp_ratio)
-                    rows_per_unit = 1
-                else:
-                    unit_scores = np.asarray(scores_by_type["attention"][layer_id], dtype=np.float32)
-                    ratio = float(attention_ratio)
-                    rows_per_unit = head_dim
-
-                if orientation == "rows":
-                    if module_name in {"self_attn.k_proj", "self_attn.v_proj"}:
-                        rows_per_unit = head_dim
-                    row_counts = allocate_row_prune_counts(
-                        unit_scores,
-                        rows_per_unit=rows_per_unit,
-                        columns=weight.shape[1],
-                        target_ratio=ratio,
-                        spread=row_spread,
-                        temperature=temperature,
-                    )
-                    if row_counts.size != weight.shape[0]:
-                        raise ValueError(
-                            f"{module_name} rows={weight.shape[0]} but expanded score rows={row_counts.size}"
-                        )
-                    _mask_rows_variable_k_(weight, input_scale, row_counts, chunk_rows)
-                else:
-                    if module_name == "mlp.down_proj":
-                        column_factor = rank_normalize(unit_scores, floor=score_floor)
-                    else:
-                        column_factor = _expanded_head_factor(unit_scores, head_dim, floor=score_floor)
-                    _mask_rows_fixed_k_with_column_factor_(
-                        weight,
-                        input_scale,
-                        column_factor,
-                        ratio,
-                        chunk_rows,
-                    )
-
-                after_zero = int((weight == 0).sum().item())
-                summaries.append(
-                    {
-                        "layer": layer_id,
-                        "module": module_name,
-                        "rows": int(weight.shape[0]),
-                        "columns": int(weight.shape[1]),
-                        "target_ratio": ratio,
-                        "zeros_before": before_zero,
-                        "zeros_after": after_zero,
-                        "actual_ratio": after_zero / weight.numel(),
-                    }
+                unit_type = "attention" if module_name.startswith("self_attn.") else "mlp"
+                ratio = attention_ratio if unit_type == "attention" else mlp_ratio
+                input_scale = torch.as_tensor(
+                    response_cache.load_activation_scale(layer_id, module_name),
+                    device=module.weight.device,
+                    dtype=torch.float32,
                 )
-                print(
-                    f"  [wanda-weight] layer={layer_id:02d} module={module_name:<20} "
-                    f"target={ratio:.4f} actual={after_zero / weight.numel():.6f}",
-                    flush=True,
+                summary = apply_guided_wanda_module_(
+                    module_name,
+                    module,
+                    input_scale,
+                    np.asarray(scores_by_type[unit_type][layer_id]),
+                    ratio,
+                    head_dim,
+                    row_spread=row_spread,
+                    row_temperature=temperature,
+                    guidance_strength=guidance_strength,
+                    chunk_rows=chunk_rows,
                 )
+                summary["layer"] = layer_id
+                summaries.append(summary)
     return summaries
 
 
