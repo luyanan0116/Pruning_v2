@@ -8,8 +8,12 @@ import torch
 from lib.paper_pruning.apply import zero_attention_heads_, zero_mlp_channels_, zero_structured_units_
 from lib.paper_pruning.collector import collect_gradient_response_cache
 from lib.paper_pruning.config import FrequencyConfig, GranularBallConfig, LCBConfig, PipelineConfig
-from lib.paper_pruning.granular_ball import build_multigranularity_hierarchy, layer_localization_features
-from lib.paper_pruning.mi import build_frequency_spectrum
+from lib.paper_pruning.granular_ball import (
+    build_multigranularity_hierarchy,
+    layer_localization_features,
+    multi_granularity_local_mi,
+)
+from lib.paper_pruning.mi import build_frequency_spectrum, estimate_knn_mi_matrix
 from lib.paper_pruning.pipeline import score_layer
 from lib.paper_pruning.selection import resolve_prune_count, select_bottom_k, split_into_steps
 from lib.paper_pruning.wanda_weight import (
@@ -372,3 +376,99 @@ def test_zero_guidance_and_zero_spread_matches_fixed_row_wanda():
         chunk_rows=3,
     )
     assert torch.equal(module.weight == 0, expected)
+
+
+def test_fast_small_mi_matches_numpy_path():
+    rng = np.random.default_rng(81)
+    values = rng.normal(size=(48, 4))
+    events = np.tile(np.arange(3), 16)
+    fast = estimate_knn_mi_matrix(
+        values, events, FrequencyConfig(mi_neighbors=3, fast_small_mi=True)
+    )
+    slow = estimate_knn_mi_matrix(
+        values, events, FrequencyConfig(mi_neighbors=3, fast_small_mi=False)
+    )
+    assert np.allclose(fast, slow, rtol=1e-11, atol=1e-12)
+
+
+def test_probe_kde_scope_does_not_change_primary_granular_scores():
+    x, events, _ = synthetic_responses(9)
+    spectrum = build_frequency_spectrum(
+        x, events, FrequencyConfig(fine_bins=8, target_bands=4, probe_units=6)
+    )
+    common = dict(
+        purity_thresholds=(0.55, 0.65),
+        min_ball_size=6,
+        max_balls=12,
+        max_depth=3,
+        min_event_classes=1,
+        localization_mode="unit_local",
+        workers=1,
+        worker_chunk_size=8,
+    )
+    all_knn, all_kde, _ = multi_granularity_local_mi(
+        spectrum.band_energy,
+        events,
+        FrequencyConfig(fine_bins=8, target_bands=4, probe_units=6),
+        GranularBallConfig(**common, kde_scope="all"),
+        compute_kde=True,
+        kde_unit_indices=None,
+    )
+    probe_knn, probe_kde, _ = multi_granularity_local_mi(
+        spectrum.band_energy,
+        events,
+        FrequencyConfig(fine_bins=8, target_bands=4, probe_units=6),
+        GranularBallConfig(**common, kde_scope="probe"),
+        compute_kde=True,
+        kde_unit_indices=spectrum.probe_indices,
+    )
+    assert np.allclose(all_knn, probe_knn, rtol=1e-12, atol=1e-12)
+    assert np.isfinite(probe_kde[spectrum.probe_indices]).all()
+    missing = np.setdiff1d(np.arange(probe_kde.shape[0]), spectrum.probe_indices)
+    assert np.isnan(probe_kde[missing]).all()
+    assert np.isfinite(all_kde).all()
+
+
+def test_parallel_lcb_repeats_are_deterministic():
+    x, events, scenarios = synthetic_responses(11)
+    gb = GranularBallConfig(
+        purity_thresholds=(0.55, 0.65),
+        min_ball_size=6,
+        max_balls=12,
+        max_depth=3,
+        min_event_classes=1,
+        localization_mode="unit_local",
+        workers=4,
+        worker_chunk_size=8,
+        kde_scope="probe",
+    )
+    base = dict(
+        frequency=FrequencyConfig(fine_bins=8, target_bands=4, mi_neighbors=2),
+        granular_ball=gb,
+    )
+    serial = score_layer(
+        x,
+        events,
+        scenarios,
+        PipelineConfig(
+            **base,
+            lcb=LCBConfig(
+                repeats=3, sample_fraction=0.75, random_state=19, workers=1
+            ),
+        ),
+        layer_id=2,
+    )
+    parallel = score_layer(
+        x,
+        events,
+        scenarios,
+        PipelineConfig(
+            **base,
+            lcb=LCBConfig(
+                repeats=3, sample_fraction=0.75, random_state=19, workers=3
+            ),
+        ),
+        layer_id=2,
+    )
+    assert np.array_equal(serial.bootstrap_scores, parallel.bootstrap_scores)
+    assert np.array_equal(serial.lcb_score, parallel.lcb_score)

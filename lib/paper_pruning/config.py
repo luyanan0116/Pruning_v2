@@ -21,6 +21,9 @@ class FrequencyConfig:
     kde_bandwidth_scale: float = 1.0
     eps: float = 1e-8
     random_state: int = 0
+    fast_small_mi: bool = True
+    fast_small_mi_max_features: int = 16
+    fast_small_mi_max_samples: int = 512
 
     def validate(self) -> None:
         if self.fine_bins < 2:
@@ -33,6 +36,10 @@ class FrequencyConfig:
             raise ValueError("probe_units must be >= 1")
         if self.kde_bandwidth_scale <= 0:
             raise ValueError("kde_bandwidth_scale must be positive")
+        if self.fast_small_mi_max_features < 1:
+            raise ValueError("fast_small_mi_max_features must be >= 1")
+        if self.fast_small_mi_max_samples < 4:
+            raise ValueError("fast_small_mi_max_samples must be >= 4")
         if self.band_weights is not None and len(self.band_weights) != self.target_bands:
             raise ValueError("band_weights length must equal target_bands")
 
@@ -53,6 +60,8 @@ class GranularBallConfig:
     kmeans_iterations: int = 12
     localization_mode: str = "layer_shared"
     workers: int = 1
+    worker_chunk_size: int = 64
+    kde_scope: str = "probe"
     variance_floor: float = 1e-8
     random_state: int = 0
 
@@ -79,6 +88,10 @@ class GranularBallConfig:
             raise ValueError("localization_mode must be layer_shared or unit_local")
         if self.workers < 1:
             raise ValueError("workers must be >= 1")
+        if self.worker_chunk_size < 1:
+            raise ValueError("worker_chunk_size must be >= 1")
+        if self.kde_scope not in {"all", "probe", "none"}:
+            raise ValueError("kde_scope must be all, probe or none")
         if self.variance_floor <= 0:
             raise ValueError("variance_floor must be positive")
 
@@ -94,6 +107,7 @@ class LCBConfig:
     stratify_by_scenario: bool = True
     cluster_by_base_sample: bool = True
     random_state: int = 0
+    workers: int = 1
 
     def validate(self) -> None:
         if self.repeats < 2:
@@ -104,6 +118,8 @@ class LCBConfig:
             raise ValueError("scenario_fraction must be in (0, 1]")
         if self.lcb_lambda < 0:
             raise ValueError("lcb_lambda must be non-negative")
+        if self.workers < 1:
+            raise ValueError("LCB workers must be >= 1")
 
 
 @dataclass(frozen=True)

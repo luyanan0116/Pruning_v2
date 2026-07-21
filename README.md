@@ -1,3 +1,23 @@
+# Pruning paper-aligned v6 fast
+
+This release keeps the v5 paper-aligned MI → granular-ball → repeated LCB → coverage/budget pipeline, while accelerating the strict per-unit granular-ball implementation. See `FAST_ACCELERATION_REPORT.md`.
+
+Recommended command for the paths used in this project:
+
+```bash
+bash scripts/run_fast_paper_ablation.sh
+```
+
+Important fast-path controls:
+
+```text
+--paper_fast_small_mi       exact Numba JIT for small ball-level kNN MI
+--paper_kde_scope probe     KDE only on representative units; does not affect masks/PPL
+--paper_gb_workers 16-32    total unit-local CPU worker budget
+--paper_gb_chunk_size 64    amortizes thread scheduling overhead
+--paper_lcb_workers 2-4     deterministic parallel LCB repeats
+```
+
 # Pruning Paper-Aligned v5
 
 基于 Wanda 工程骨架实现的论文对齐版本，主要对应：

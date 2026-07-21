@@ -102,6 +102,7 @@ def _pipeline_config(args) -> PipelineConfig:
             probe_units=args.paper_probe_units,
             kde_bandwidth_scale=args.paper_kde_bandwidth_scale,
             random_state=args.seed,
+            fast_small_mi=args.paper_fast_small_mi,
         ),
         granular_ball=GranularBallConfig(
             purity_thresholds=_parse_float_tuple(args.paper_purity_thresholds),
@@ -114,6 +115,8 @@ def _pipeline_config(args) -> PipelineConfig:
             min_event_classes=args.paper_min_event_classes,
             localization_mode=args.paper_gb_localization,
             workers=args.paper_gb_workers,
+            worker_chunk_size=args.paper_gb_chunk_size,
+            kde_scope=args.paper_kde_scope,
             random_state=args.seed,
         ),
         lcb=LCBConfig(
@@ -124,6 +127,7 @@ def _pipeline_config(args) -> PipelineConfig:
             stratify_by_scenario=True,
             cluster_by_base_sample=True,
             random_state=args.seed,
+            workers=args.paper_lcb_workers,
         ),
         budget=BudgetConfig(
             coverage_ratio=args.paper_band_coverage_ratio,

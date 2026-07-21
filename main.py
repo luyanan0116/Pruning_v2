@@ -102,6 +102,8 @@ def main():
     parser.add_argument("--paper_num_bands", type=int, default=4,
                         help="target bands after task-driven adjacent merging")
     parser.add_argument("--paper_mi_neighbors", type=int, default=3)
+    parser.add_argument("--paper_fast_small_mi", action=argparse.BooleanOptionalAction, default=True,
+                        help="use an exact Numba-compiled kNN path for the many small ball-level MI problems")
     parser.add_argument("--paper_probe_units", type=int, default=64,
                         help="representative units for task-driven adjacent frequency-bin merging")
     parser.add_argument("--paper_kde_bandwidth_scale", type=float, default=1.0)
@@ -112,7 +114,15 @@ def main():
     parser.add_argument("--paper_gb_localization", type=str, default="unit_local",
                         choices=["unit_local", "layer_shared"],
                         help="unit_local follows the paper literally; layer_shared is a faster diagnostic approximation")
-    parser.add_argument("--paper_gb_workers", type=int, default=8)
+    parser.add_argument("--paper_gb_workers", type=int, default=16,
+                        help="total CPU worker budget for strict unit-local granular balls")
+    parser.add_argument("--paper_gb_chunk_size", type=int, default=64,
+                        help="units handled per worker task; reduces thread scheduling overhead")
+    parser.add_argument("--paper_kde_scope", type=str, default="probe",
+                        choices=["all", "probe", "none"],
+                        help="auxiliary KDE diagnostics: all units, probe units only, or disabled; never changes kNN pruning scores")
+    parser.add_argument("--paper_lcb_workers", type=int, default=4,
+                        help="parallel LCB repeats; total nested workers remain bounded by paper_gb_workers")
     parser.add_argument("--paper_min_purity_gain", type=float, default=0.0)
     parser.add_argument("--paper_min_radius_reduction", type=float, default=0.0)
     parser.add_argument("--paper_compactness_ratio", type=float, default=0.55)
