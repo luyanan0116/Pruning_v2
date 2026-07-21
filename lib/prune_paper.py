@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, Mapping
+from typing import Dict, Mapping, Tuple
 
 import numpy as np
 import torch
@@ -29,6 +29,11 @@ from .paper_pruning.reporting import (
     write_selection_files,
 )
 from .paper_pruning.selection import resolve_prune_count, select_bottom_k
+from .paper_pruning.wanda_weight import (
+    ALL_LINEAR_MODULES,
+    apply_paper_wanda_weight_masks_,
+    write_weight_mask_summary,
+)
 
 
 PAPER_METHODS = {"paper_mi", "paper_mi_gb", "paper_mi_gb_lcb", "lcb"}
@@ -138,6 +143,13 @@ def _config_payload(args, config: PipelineConfig, cache, targets: tuple[str, ...
             for unit_type in targets
         },
         "prune_step": int(args.paper_prune_step),
+        "mask_style": args.paper_mask_style,
+        "wanda_weight": {
+            "score_floor": float(args.paper_wanda_score_floor),
+            "row_spread": float(args.paper_wanda_row_spread),
+            "temperature": float(args.paper_wanda_temperature),
+            "chunk_rows": int(args.paper_wanda_chunk_rows),
+        },
         "response_cache": str(cache.root.resolve()),
         "num_observations": cache.num_observations,
         "response_length": cache.response_length,
@@ -161,22 +173,49 @@ def _load_selection_file(path: Path) -> Dict[str, Dict[str, Dict[int, np.ndarray
     }
 
 
+def _save_unit_scores(
+    path: Path,
+    scores: Mapping[str, Mapping[str, Mapping[int, np.ndarray]]],
+) -> None:
+    arrays = {}
+    for method, type_map in scores.items():
+        for unit_type, layer_map in type_map.items():
+            for layer_id, values in layer_map.items():
+                arrays[f"{method}__{unit_type}__{int(layer_id)}"] = np.asarray(values, dtype=np.float32)
+    np.savez_compressed(path, **arrays)
+
+
+def _load_unit_scores(path: Path) -> Dict[str, Dict[str, Dict[int, np.ndarray]]]:
+    result: Dict[str, Dict[str, Dict[int, np.ndarray]]] = {method: {} for method in METHODS}
+    with np.load(path) as archive:
+        for key in archive.files:
+            method, unit_type, layer_raw = key.split("__", 2)
+            result.setdefault(method, {}).setdefault(unit_type, {})[int(layer_raw)] = np.asarray(
+                archive[key], dtype=np.float32
+            )
+    return result
+
+
 def _score_or_load(
     args,
     cache,
     report_dir: Path,
     targets: tuple[str, ...],
-) -> Dict[str, Dict[str, Dict[int, np.ndarray]]]:
+) -> Tuple[
+    Dict[str, Dict[str, Dict[int, np.ndarray]]],
+    Dict[str, Dict[str, Dict[int, np.ndarray]]],
+]:
     config = _pipeline_config(args)
     payload = _config_payload(args, config, cache, targets)
     config_path = report_dir / "score_config.json"
     indices_path = report_dir / "prune_indices.json"
+    unit_scores_path = report_dir / "unit_scores.npz"
 
-    if indices_path.exists() and config_path.exists() and not args.paper_overwrite_scores:
+    if indices_path.exists() and unit_scores_path.exists() and config_path.exists() and not args.paper_overwrite_scores:
         previous = json.loads(config_path.read_text(encoding="utf-8"))
         if previous == payload:
             print(f"reusing paper-aligned scores from {report_dir}")
-            return _load_selection_file(indices_path)
+            return _load_selection_file(indices_path), _load_unit_scores(unit_scores_path)
         print("paper score configuration changed; recomputing scores")
 
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -187,6 +226,10 @@ def _score_or_load(
         prune_step=args.paper_prune_step,
     )
     selections: Dict[str, Dict[str, Dict[int, np.ndarray]]] = {
+        method: {unit_type: {} for unit_type in targets}
+        for method in METHODS
+    }
+    unit_scores: Dict[str, Dict[str, Dict[int, np.ndarray]]] = {
         method: {unit_type: {} for unit_type in targets}
         for method in METHODS
     }
@@ -209,11 +252,17 @@ def _score_or_load(
                     ratio,
                     exact_count,
                 )
-                layer_selections = {
-                    "paper_mi": select_bottom_k(scores.mi_score, prune_count),
-                    "paper_mi_gb": select_bottom_k(scores.granular_score, prune_count),
-                    "paper_mi_gb_lcb": select_bottom_k(scores.lcb_score, prune_count),
+                layer_score_vectors = {
+                    "paper_mi": np.asarray(scores.mi_score, dtype=np.float32),
+                    "paper_mi_gb": np.asarray(scores.granular_score, dtype=np.float32),
+                    "paper_mi_gb_lcb": np.asarray(scores.lcb_score, dtype=np.float32),
                 }
+                layer_selections = {
+                    method: select_bottom_k(values, prune_count)
+                    for method, values in layer_score_vectors.items()
+                }
+                for method, values in layer_score_vectors.items():
+                    unit_scores[method][unit_type][layer_id] = values.copy()
                 for method, indices in layer_selections.items():
                     selections[method][unit_type][layer_id] = indices
                 writer.add_layer(layer_id, unit_type, scores, layer_selections)
@@ -253,8 +302,9 @@ def _score_or_load(
         writer.close()
 
     write_selection_files(report_dir, selections, args.paper_prune_step)
+    _save_unit_scores(unit_scores_path, unit_scores)
     config_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    return selections
+    return selections, unit_scores
 
 
 def _print_mask_overlap(
@@ -283,7 +333,7 @@ def _print_mask_overlap(
             print("  WARNING: masks are identical, so identical PPL is expected.")
 
 
-def _validate_cache_against_model(cache, model, targets: tuple[str, ...]) -> None:
+def _validate_cache_against_model(args, cache, model, targets: tuple[str, ...]) -> None:
     layers = getattr(getattr(model, "model", model), "layers", None)
     if layers is None or len(layers) != cache.num_layers:
         raise ValueError(
@@ -310,7 +360,7 @@ def _validate_cache_against_model(cache, model, targets: tuple[str, ...]) -> Non
             )
             if num_heads != num_kv_heads:
                 raise ValueError(
-                    "MLP+attention structured pruning currently expects standard multi-head attention "
+                    "paper MLP+attention scoring currently expects standard multi-head attention "
                     f"with equal query/KV head counts; layer {layer_id} has {num_heads}/{num_kv_heads}."
                 )
             if cache.unit_counts["attention"].get(layer_id) != num_heads:
@@ -319,6 +369,20 @@ def _validate_cache_against_model(cache, model, targets: tuple[str, ...]) -> Non
                     f"{cache.unit_counts['attention'].get(layer_id)} attention heads, "
                     f"current model has {num_heads}; rebuild the cache"
                 )
+    if args.paper_mask_style == "wanda_weight":
+        required = set()
+        if "attention" in targets:
+            required.update(name for name in ALL_LINEAR_MODULES if name.startswith("self_attn."))
+        if "mlp" in targets:
+            required.update(name for name in ALL_LINEAR_MODULES if name.startswith("mlp."))
+        for layer_id in range(cache.num_layers):
+            for module_name in required:
+                path = cache.activation_scale_path(layer_id, module_name)
+                if not path.exists():
+                    raise ValueError(
+                        f"response cache lacks Wanda activation statistics for {module_name}; "
+                        "rebuild it with --paper_overwrite_cache"
+                    )
 
 
 def _print_applied_budget(
@@ -347,7 +411,7 @@ def _print_applied_budget(
 
 def prune_paper(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
     if prune_n or prune_m:
-        raise ValueError("paper-aligned pruning supports structured units, not N:M weight sparsity")
+        raise ValueError("paper-aligned pruning currently supports unstructured Wanda-style weights or structured units, not N:M masks")
     method = _canonical_method(args.prune_method)
     if method not in METHODS:
         raise ValueError(f"unsupported paper method: {args.prune_method}")
@@ -376,12 +440,37 @@ def prune_paper(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
             overwrite=args.paper_overwrite_cache,
         )
 
-    _validate_cache_against_model(cache, model, targets)
+    _validate_cache_against_model(args, cache, model, targets)
     report_dir = Path(args.paper_report_dir)
-    selections = _score_or_load(args, cache, report_dir, targets)
+    selections, unit_scores = _score_or_load(args, cache, report_dir, targets)
     _print_mask_overlap(selections)
-    print(f"applying {method} structured masks for targets={','.join(targets)}")
     selected = selections[method]
-    zero_structured_units_(model, selected)
-    _print_applied_budget(model, selected)
-    return selected
+
+    if args.paper_mask_style == "structured_unit":
+        print(f"applying {method} structured masks for targets={','.join(targets)}")
+        zero_structured_units_(model, selected)
+        _print_applied_budget(model, selected)
+        return selected
+
+    mlp_ratio, _ = _target_budget(args, "mlp")
+    attention_ratio, _ = _target_budget(args, "attention")
+    print(
+        f"applying {method} paper-guided Wanda weight masks for targets={','.join(targets)}; "
+        f"mlp_ratio={mlp_ratio:.4f}, attention_ratio={attention_ratio:.4f}"
+    )
+    summaries = apply_paper_wanda_weight_masks_(
+        model,
+        unit_scores[method],
+        cache,
+        targets,
+        mlp_ratio=mlp_ratio,
+        attention_ratio=attention_ratio,
+        score_floor=args.paper_wanda_score_floor,
+        row_spread=args.paper_wanda_row_spread,
+        temperature=args.paper_wanda_temperature,
+        chunk_rows=args.paper_wanda_chunk_rows,
+    )
+    summary_path = report_dir / f"weight_mask_summary_{method}.csv"
+    write_weight_mask_summary(summary_path, summaries)
+    print(f"saved Wanda-style weight mask summary: {summary_path}")
+    return summaries

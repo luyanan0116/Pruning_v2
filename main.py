@@ -57,7 +57,25 @@ def main():
     parser.add_argument("--attention_sparsity_ratio", type=float, default=None,
                         help="structured attention-head sparsity; default uses sparsity_ratio")
     parser.add_argument("--paper_prune_targets", type=str, default="mlp,attention",
-                        help="comma-separated structured targets: mlp,attention")
+                        help="comma-separated targets: mlp,attention")
+    parser.add_argument(
+        "--paper_mask_style",
+        type=str,
+        default="wanda_weight",
+        choices=["wanda_weight", "structured_unit"],
+        help=(
+            "wanda_weight applies Wanda-style unstructured masks to all q/k/v/o and "
+            "gate/up/down matrices; structured_unit removes complete MLP channels/heads"
+        ),
+    )
+    parser.add_argument("--paper_wanda_score_floor", type=float, default=0.05,
+                        help="minimum rank factor used to protect high/low contribution scales")
+    parser.add_argument("--paper_wanda_row_spread", type=float, default=0.8,
+                        help="how strongly paper scores redistribute row sparsity around the target")
+    parser.add_argument("--paper_wanda_temperature", type=float, default=2.0,
+                        help="rank-allocation temperature for Wanda-style row budgets")
+    parser.add_argument("--paper_wanda_chunk_rows", type=int, default=256,
+                        help="row chunk size used while building per-weight masks")
     parser.add_argument("--paper_prune_step", type=int, default=10,
                         help="export selected channel indices in batches of this size")
     parser.add_argument("--paper_score_nsamples", type=int, default=32,
@@ -106,10 +124,27 @@ def main():
             parser.error("--paper_prune_targets must contain mlp and/or attention")
         mlp_ratio = args.sparsity_ratio if args.mlp_sparsity_ratio is None else args.mlp_sparsity_ratio
         attn_ratio = args.sparsity_ratio if args.attention_sparsity_ratio is None else args.attention_sparsity_ratio
-        if "mlp" in targets and args.prune_per_layer <= 0 and not 0 < mlp_ratio < 1:
-            parser.error("MLP pruning requires --prune_per_layer > 0 or a ratio in (0,1)")
-        if "attention" in targets and args.attention_prune_per_layer <= 0 and not 0 < attn_ratio < 1:
-            parser.error("attention pruning requires --attention_prune_per_layer > 0 or a ratio in (0,1)")
+        if args.paper_mask_style == "wanda_weight":
+            if args.prune_per_layer > 0 or args.attention_prune_per_layer > 0:
+                parser.error(
+                    "--prune_per_layer and --attention_prune_per_layer are only valid with "
+                    "--paper_mask_style structured_unit"
+                )
+            if "mlp" in targets and not 0 < mlp_ratio < 1:
+                parser.error("Wanda-style MLP weight pruning requires a ratio in (0,1)")
+            if "attention" in targets and not 0 < attn_ratio < 1:
+                parser.error("Wanda-style attention weight pruning requires a ratio in (0,1)")
+            if not 0 < args.paper_wanda_score_floor <= 1:
+                parser.error("--paper_wanda_score_floor must be in (0,1]")
+            if not 0 <= args.paper_wanda_row_spread < 1:
+                parser.error("--paper_wanda_row_spread must be in [0,1)")
+            if args.paper_wanda_temperature <= 0 or args.paper_wanda_chunk_rows <= 0:
+                parser.error("Wanda temperature and chunk rows must be positive")
+        else:
+            if "mlp" in targets and args.prune_per_layer <= 0 and not 0 < mlp_ratio < 1:
+                parser.error("MLP pruning requires --prune_per_layer > 0 or a ratio in (0,1)")
+            if "attention" in targets and args.attention_prune_per_layer <= 0 and not 0 < attn_ratio < 1:
+                parser.error("attention pruning requires --attention_prune_per_layer > 0 or a ratio in (0,1)")
 
     # Setting seeds for reproducibility
     np.random.seed(args.seed)

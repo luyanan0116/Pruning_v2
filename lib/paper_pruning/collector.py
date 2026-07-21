@@ -10,8 +10,17 @@ import torch
 import torch.nn.functional as F
 
 
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 UNIT_TYPES = ("mlp", "attention")
+LINEAR_MODULES = (
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.o_proj",
+    "mlp.gate_proj",
+    "mlp.up_proj",
+    "mlp.down_proj",
+)
 
 
 @dataclass(frozen=True)
@@ -25,6 +34,7 @@ class ResponseCache:
     events: np.ndarray
     scenario_ids: np.ndarray
     losses: np.ndarray
+    linear_modules: tuple[str, ...]
 
     def layer_path(self, layer_id: int, unit_type: str = "mlp") -> Path:
         if unit_type not in UNIT_TYPES:
@@ -33,6 +43,15 @@ class ResponseCache:
 
     def load_layer(self, layer_id: int, unit_type: str = "mlp", mmap_mode: str = "r") -> np.ndarray:
         return np.load(self.layer_path(layer_id, unit_type), mmap_mode=mmap_mode)
+
+    def activation_scale_path(self, layer_id: int, module_name: str) -> Path:
+        if module_name not in self.linear_modules:
+            raise ValueError(f"unknown cached linear module: {module_name}")
+        safe_name = module_name.replace(".", "__")
+        return self.root / f"layer_{int(layer_id):03d}_{safe_name}_input_scale.npy"
+
+    def load_activation_scale(self, layer_id: int, module_name: str, mmap_mode: str = "r") -> np.ndarray:
+        return np.load(self.activation_scale_path(layer_id, module_name), mmap_mode=mmap_mode)
 
 
 def parse_scenario_ratios(raw: str | Sequence[float]) -> List[float]:
@@ -153,11 +172,16 @@ def load_response_cache(cache_dir: str | Path) -> ResponseCache:
         events=events,
         scenario_ids=scenarios,
         losses=losses,
+        linear_modules=tuple(metadata.get("linear_modules", LINEAR_MODULES)),
     )
     for unit_type in UNIT_TYPES:
         for layer_id in range(cache.num_layers):
             if not cache.layer_path(layer_id, unit_type).exists():
                 raise FileNotFoundError(cache.layer_path(layer_id, unit_type))
+    for layer_id in range(cache.num_layers):
+        for module_name in cache.linear_modules:
+            if not cache.activation_scale_path(layer_id, module_name).exists():
+                raise FileNotFoundError(cache.activation_scale_path(layer_id, module_name))
     return cache
 
 
@@ -222,6 +246,20 @@ def collect_gradient_response_cache(
             shape=(observations, head_count, response_length),
         )
 
+    activation_sums: Dict[int, Dict[str, torch.Tensor]] = {}
+    activation_counts: Dict[int, Dict[str, int]] = {}
+    for layer_id, layer in enumerate(layers):
+        activation_sums[layer_id] = {}
+        activation_counts[layer_id] = {}
+        for module_name in LINEAR_MODULES:
+            module = layer
+            for part in module_name.split("."):
+                module = getattr(module, part)
+            activation_sums[layer_id][module_name] = torch.zeros(
+                int(module.in_features), device=module.weight.device, dtype=torch.float32
+            )
+            activation_counts[layer_id][module_name] = 0
+
     losses = np.zeros(observations, dtype=np.float64)
     scenario_ids = np.zeros(observations, dtype=np.int64)
     written = {
@@ -259,7 +297,23 @@ def collect_gradient_response_cache(
 
         handles.append(module.register_forward_pre_hook(pre_hook))
 
+    def register_activation_hook(module: torch.nn.Module, layer_id: int, module_name: str) -> None:
+        def pre_hook(_module, inputs):
+            activation = inputs[0].detach().float()
+            reduce_dims = tuple(range(activation.ndim - 1))
+            activation_sums[layer_id][module_name].add_(activation.square().sum(dim=reduce_dims))
+            activation_counts[layer_id][module_name] += int(activation.numel() // activation.shape[-1])
+            return None
+
+        handles.append(module.register_forward_pre_hook(pre_hook))
+
     for layer_id, layer in enumerate(layers):
+        for module_name in LINEAR_MODULES:
+            module = layer
+            for part in module_name.split("."):
+                module = getattr(module, part)
+            register_activation_hook(module, layer_id, module_name)
+
         register_response_hook(
             layer.mlp.down_proj,
             layer_id,
@@ -346,6 +400,17 @@ def collect_gradient_response_cache(
     for unit_type in UNIT_TYPES:
         for mmap in maps[unit_type].values():
             mmap.flush()
+    for layer_id in range(num_layers):
+        for module_name in LINEAR_MODULES:
+            count = activation_counts[layer_id][module_name]
+            if count <= 0:
+                raise RuntimeError(f"no activation statistics collected for layer {layer_id} {module_name}")
+            mean_square = (activation_sums[layer_id][module_name] / float(count)).detach().cpu().numpy()
+            safe_name = module_name.replace(".", "__")
+            np.save(
+                root / f"layer_{layer_id:03d}_{safe_name}_input_scale.npy",
+                mean_square.astype(np.float32, copy=False),
+            )
     events = _quantile_events(losses, scenario_ids, event_bins)
     np.save(root / "events.npy", events)
     np.save(root / "scenario_ids.npy", scenario_ids)
@@ -362,12 +427,14 @@ def collect_gradient_response_cache(
         "attention_layouts": {
             str(key): value for key, value in attention_layouts.items()
         },
+        "linear_modules": list(LINEAR_MODULES),
         "scenario_ratios": ratios,
         "event_bins": event_bins,
         "response_definitions": {
             "mlp": "down_proj_input * d(causal_lm_loss)/d(down_proj_input)",
             "attention": "sum_head_dim(o_proj_input * d(causal_lm_loss)/d(o_proj_input))",
         },
+        "activation_scale_definition": "mean over calibration tokens of linear-module input squared",
     }
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     return load_response_cache(root)

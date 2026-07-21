@@ -1,214 +1,48 @@
-# Pruning
+# Pruning v4: 论文评分 + Wanda 风格全线性层权重剪枝
 
-面向 Llama / Mistral 类模型的频域互信息、粒球局部化与 LCB 稳健结构化剪枝实验代码。
+本版本保留三组论文消融评分：
 
-本版本新增了与论文技术路线对应的三组消融：
+1. `paper_mi`：频域互信息；
+2. `paper_mi_gb`：频域互信息 + 多粒度粒球局部化；
+3. `paper_mi_gb_lcb`：频域互信息 + 粒球 + 重复估计 LCB。
 
-| 方法 | 命令参数 | 实际评分路径 |
-|---|---|---|
-| 只使用互信息 | `paper_mi` | 梯度响应 → 样本内标准化 → DCT → 频率桶能量 → 相邻频带合并 → MI |
-| 互信息 + 粒球 | `paper_mi_gb` | 上述步骤 → 每层粒球局部化 → 球内 MI → 多粒度融合 |
-| 互信息 + 粒球 + LCB | `paper_mi_gb_lcb` | 上述步骤 → 事件/场景分层重复抽样 → 每次重建粒球 → 均值、标准差、LCB |
+同时新增两种掩码口径：
 
-旧参数 `--prune_method lcb` 已映射到 `paper_mi_gb_lcb`。
+| 参数 | 作用 |
+|---|---|
+| `--paper_mask_style wanda_weight` | 推荐。像 Wanda 一样对 Transformer 层中的线性权重做非结构化剪枝，覆盖注意力 `q/k/v/o` 和 MLP `gate/up/down`。|
+| `--paper_mask_style structured_unit` | 论文结构单元消融。完整置零 MLP 中间通道和注意力头，50% 时非常激进。|
 
-## 关键修改
+## Wanda 风格与“剪 50% 注意力头”的区别
 
-### 1. 任务损失梯度响应
-
-剪枝单元统一定义为每层 MLP 中间通道。代码在 `mlp.down_proj` 输入处采集：
-
-```text
-r_i(t) = z_i(t) × ∂L_task / ∂z_i(t)
-```
-
-其中 `z_i(t)` 是第 `i` 个 MLP 通道在序列位置 `t` 的输出，`L_task` 为因果语言模型损失。响应序列会自适应压缩并保存为内存映射文件，避免一次性占满 CPU 内存。
-
-### 2. 频域互信息
-
-实现位置：`lib/paper_pruning/mi.py`
-
-流程包括：
-
-1. 每个样本、每个结构单元单独标准化；
-2. 沿序列位置执行正交 DCT-II；
-3. 按 DCT 系数平方和统计频率桶能量；
-4. 根据任务事件相关性合并相邻频率桶；
-5. 使用 kNN 互信息作为主估计器，并用高斯核密度互信息作为辅助估计器；
-6. 对频带贡献加权汇总。
-
-任务事件 `Y` 默认由每条校准序列的因果语言模型损失进行分位数离散化得到。为了避免上下文长度直接决定事件类别，事件分箱在每个场景内部独立完成。
-
-### 3. 粒球多粒度局部化
-
-实现位置：`lib/paper_pruning/granular_ball.py`
-
-粒球按层构建，而不是整个模型只构建一次，也不是每个通道单独聚类一次：
+Wanda 的 50% 指每个线性权重矩阵中的权重稀疏度，不是删除 50% 完整注意力头。官方 Wanda 会递归处理 Transformer block 内全部 `nn.Linear`，包括：
 
 ```text
-每一层一套响应空间
-同层通道共享粒球划分
-各通道在球内分别估计互信息
+self_attn.q_proj
+self_attn.k_proj
+self_attn.v_proj
+self_attn.o_proj
+mlp.gate_proj
+mlp.up_proj
+mlp.down_proj
 ```
 
-粒球分裂同时考虑：
-
-- 事件纯度是否达到当前阈值；
-- 球半径是否足够紧致；
-- 分裂后事件纯度是否提升；
-- 分裂后平均半径是否下降；
-- 子球最小样本数和局部事件类别数。
-
-`0.65,0.75,0.85` 三个阈值使用嵌套层级，细粒度在粗粒度结果上继续分裂，因此粒球数量不会随纯度阈值升高而减少。
-
-### 4. LCB 稳健排序
-
-每次重复估计都会重新执行：
+本项目的 `wanda_weight` 模式采用：
 
 ```text
-事件 + 场景联合分层抽样
-→ 重新合并频带
-→ 重新构建粒球
-→ 重新计算局部互信息
+基础权重重要性 = |W| × sqrt(校准输入二阶矩)
 ```
 
-最终计算：
+再用 MI、MI+粒球或 MI+粒球+LCB 的结构贡献分数调节权重预算落点：
 
-```text
-LCB_i = mean(S_i) - lambda × std(S_i)
-```
+- `gate_proj`、`up_proj`：低贡献 MLP 单元的输出行获得更高稀疏度；
+- `down_proj`：低贡献 MLP 单元对应输入列更容易被剪；
+- `q_proj`、`k_proj`、`v_proj`：低贡献注意力头对应行获得更高稀疏度；
+- `o_proj`：低贡献注意力头对应输入列更容易被剪。
 
-所有通道的全局 MI、粒球贡献、重复估计均值、标准差和 LCB 都会导出。
+总权重预算保持不变，但不会强制整头或整通道完全归零，因此 50% 时通常远比结构化删除 50% 头和通道稳定。
 
-### 5. 每层按 10 个索引分批
-
-`--paper_prune_step 10` 会把每层最终选择的索引按 10 个一批写入：
-
-```text
-prune_batches_step10.json
-```
-
-最终剪枝数量有两种模式：
-
-```text
---prune_per_layer 10
-```
-
-表示每层总共剪 10 个 MLP 通道。
-
-```text
---prune_per_layer 0 --sparsity_ratio 0.15
-```
-
-表示每层剪除 15% 的 MLP 通道，但索引仍按每批 10 个导出。为了观察明显 PPL 差异，推荐使用固定比例，而不是只剪 10 个通道。只剪 10 个通道通常过于轻微，PPL 四舍五入后可能完全相同。
-
-## 一键运行三组消融
-
-```bash
-export C4_PATH=/你的路径/dataset_c4
-export WIKITEXT2_PATH=/你的路径/dataset_wikitext-raw
-
-python run_paper_ablation.py \
-  --model /你的路径/Llama-2-7b-hf \
-  --cache_dir llm_weights \
-  --sparsity_ratio 0.15 \
-  --prune_per_layer 0 \
-  --output_dir results/paper_ablation \
-  --paper_score_nsamples 32 \
-  --paper_calib_seqlen 512 \
-  --paper_scenario_ratios 0.5,0.75,1.0 \
-  --n_samples_lcb 10
-```
-
-脚本会为三个方法分别重新加载原始模型，避免在同一个模型上连续剪枝。同时复用同一份梯度响应缓存与同一套三路评分结果，保证消融公平。
-
-结果汇总：
-
-```text
-results/paper_ablation/ablation_ppl_summary.csv
-```
-
-## 单独运行一种方法
-
-```bash
-python main.py \
-  --model /你的路径/Llama-2-7b-hf \
-  --prune_method paper_mi_gb_lcb \
-  --sparsity_type unstructured \
-  --sparsity_ratio 0.15 \
-  --prune_per_layer 0 \
-  --paper_prune_step 10 \
-  --paper_cache_dir results/shared_response_cache \
-  --paper_report_dir results/shared_score_report \
-  --save results/logs
-```
-
-将 `paper_mi_gb_lcb` 替换为 `paper_mi` 或 `paper_mi_gb` 即可运行另外两组。
-
-## 输出文件
-
-`--paper_report_dir` 下会生成：
-
-```text
-all_contribution_scores.csv
-  每层、每个 MLP 通道的 MI、粒球贡献、LCB 均值、标准差、LCB 和剪枝标记
-
-granular_ball_summary.csv
-  每层、每个粒度、每个粒球的大小、纯度、半径、深度和主事件
-
-prune_indices.json
-  三种方法每层最终剪枝索引
-
-prune_batches_step10.json
-  每层按 10 个索引分批后的剪枝计划
-
-mask_overlap.csv
-  三种方法剪枝掩码的 Jaccard 相似度和变化索引数量
-
-layer_000_balls.png
-layer_000_lcb.png
-  浅层、中层、深层的局部粒球图和 LCB 贡献图
-```
-
-如果三组 PPL 仍然相同，先检查 `mask_overlap.csv`。当两组掩码完全一致时，PPL 相同是正常结果。代码不会通过人为扰动分数来伪造递减曲线。
-
-## 结构化剪枝口径
-
-当前实现同步置零：
-
-```text
-gate_proj 对应行
-up_proj 对应行
-down_proj 对应列
-```
-
-这是形状保持的结构单元消融，适合比较 PPL 与验证排序。若要获得真实推理加速，还需要在确认最终索引后物理裁切权重张量，并同步更新模型配置。
-
-## 测试
-
-```bash
-PYTHONPATH=. pytest -q tests/test_paper_pruning.py
-```
-
-当前测试覆盖：频域互信息、纯度驱动粒球层级、三路消融差异、LCB 方差、梯度响应采集以及 MLP 通道同步置零。
-
-## Structured MLP + attention-head pruning (v3)
-
-The paper-aligned methods now treat both LLaMA MLP intermediate channels and complete attention heads as prunable structural units.
-
-- MLP response: input of `mlp.down_proj` multiplied by its task-loss gradient.
-- Attention response: input of `self_attn.o_proj`, reshaped by head, multiplied by its gradient and summed over `head_dim`.
-- MLP mask: zero matching `gate_proj`/`up_proj` rows and `down_proj` columns.
-- Attention mask: zero matching `q_proj`/`k_proj`/`v_proj` rows and `o_proj` columns.
-- Tensor shapes are preserved for PPL ablation. Physical slicing is still required for wall-clock speedup.
-
-The default paper targets are now:
-
-```text
---paper_prune_targets mlp,attention
-```
-
-With standard Llama-2-7B attention, this command gives 50% structured sparsity in both parts:
+## 50% MLP + Attention 权重剪枝命令
 
 ```bash
 PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 python -u run_paper_ablation.py \
@@ -216,25 +50,115 @@ PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 python -u run_paper_ablation.py \
   --c4_path /root/dw2/Lya/dataset/dataset_c4 \
   --wikitext2_path /root/dw2/Lya/dataset/dataset_wikitext-raw \
   --cache_dir /root/dw2/Lya/models/cache \
-  --output_dir results/paper_ablation_mlp_attn_s050 \
+  --output_dir results/paper_wanda_all_linear_s050 \
+  --seed 0 \
   --sparsity_ratio 0.50 \
+  --paper_mask_style wanda_weight \
+  --paper_prune_targets mlp,attention \
   --mlp_sparsity_ratio 0.50 \
   --attention_sparsity_ratio 0.50 \
   --prune_per_layer 0 \
   --attention_prune_per_layer 0 \
-  --paper_prune_targets mlp,attention \
+  --paper_calib_dataset c4 \
   --paper_score_nsamples 16 \
   --paper_calib_seqlen 256 \
   --paper_response_length 16 \
+  --paper_event_bins 3 \
   --paper_num_bins 8 \
   --paper_num_bands 3 \
+  --paper_mi_neighbors 3 \
   --paper_scenario_ratios 0.5,1.0 \
+  --paper_purity_thresholds 0.60,0.75,0.90 \
   --paper_min_ball_size 4 \
   --paper_max_balls 32 \
+  --paper_sample_fraction 0.8 \
   --n_samples_lcb 5 \
+  --lcb_lambda 1.0 \
+  --paper_wanda_score_floor 0.05 \
+  --paper_wanda_row_spread 0.8 \
+  --paper_wanda_temperature 2.0 \
+  --paper_wanda_chunk_rows 256 \
+  --paper_plot_layers first,middle,last \
   --overwrite
 ```
 
-Old MLP-only response caches are intentionally rejected. Use a new output directory or pass `--overwrite` so attention responses are collected.
+关键参数：
 
-The exact q/k/v/o head-mask implementation currently requires `num_attention_heads == num_key_value_heads`. This includes Llama-2-7B. Grouped-query-attention models are rejected to avoid silently applying an invalid K/V mask.
+```text
+--paper_mask_style wanda_weight
+--paper_prune_targets mlp,attention
+--mlp_sparsity_ratio 0.50
+--attention_sparsity_ratio 0.50
+```
+
+这表示 MLP 的三个线性矩阵和 Attention 的四个线性矩阵都做 50% 权重剪枝，最终 `check_sparsity()` 应接近 `0.5000`。
+
+## 正式实验建议
+
+流程验证可先使用上面的 `16 × 256 × 2 场景 × 5 次 LCB`。正式结果建议逐步提高到：
+
+```text
+--paper_score_nsamples 32
+--paper_calib_seqlen 512
+--paper_scenario_ratios 0.5,0.75,1.0
+--n_samples_lcb 10
+```
+
+这些参数会显著增加计算时间。稀疏度只影响最终掩码，不会显著减少 MI、粒球和 LCB 的评分成本。
+
+## 输出文件
+
+`shared_score_report` 中包括：
+
+```text
+all_contribution_scores.csv
+  每层、每个 MLP 单元/注意力头的 MI、粒球贡献、LCB 均值、标准差与 LCB。
+
+unit_scores.npz
+  三组方法用于 Wanda 风格权重掩码的完整单位贡献向量。
+
+weight_mask_summary_paper_mi.csv
+weight_mask_summary_paper_mi_gb.csv
+weight_mask_summary_paper_mi_gb_lcb.csv
+  每层每个 q/k/v/o、gate/up/down 矩阵的目标和实际权重稀疏度。
+
+prune_indices.json
+  低贡献结构单元的排序优先集合。wanda_weight 模式下它用于解释预算落点，
+  不表示这些完整头或通道被整体置零。
+
+granular_ball_summary.csv
+layer_*_balls.png
+layer_*_lcb.png
+```
+
+## 原版 Wanda 基线
+
+项目仍保留原始 `--prune_method wanda`。该方法直接使用 Wanda 的权重与激活度量，不使用论文的 MI、粒球或 LCB：
+
+```bash
+C4_PATH=/root/dw2/Lya/dataset/dataset_c4 \
+WIKITEXT2_PATH=/root/dw2/Lya/dataset/dataset_wikitext-raw \
+CUDA_VISIBLE_DEVICES=0 python main.py \
+  --model /root/dw2/Lya/models/Llama-2-7b \
+  --cache_dir /root/dw2/Lya/models/cache \
+  --prune_method wanda \
+  --sparsity_ratio 0.50 \
+  --sparsity_type unstructured \
+  --save results/wanda_baseline
+```
+
+## 缓存兼容性
+
+v4 响应缓存除任务梯度响应外，还保存七个线性模块的输入二阶矩。旧版 v2/v3 缓存会被拒绝。首次运行必须使用新输出目录，或加：
+
+```text
+--overwrite
+```
+
+## 测试
+
+```bash
+PYTHONPATH=. pytest -q
+```
+
+当前测试覆盖频域互信息、粒球层级、LCB、MLP/Attention 梯度响应、七个线性模块的激活统计、结构化掩码和 Wanda 风格全线性层权重掩码。

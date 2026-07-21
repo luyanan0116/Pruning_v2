@@ -12,6 +12,11 @@ from lib.paper_pruning.granular_ball import build_multigranularity_hierarchy, la
 from lib.paper_pruning.mi import build_frequency_spectrum
 from lib.paper_pruning.pipeline import score_layer
 from lib.paper_pruning.selection import resolve_prune_count, select_bottom_k, split_into_steps
+from lib.paper_pruning.wanda_weight import (
+    ALL_LINEAR_MODULES,
+    allocate_row_prune_counts,
+    apply_paper_wanda_weight_masks_,
+)
 
 
 def synthetic_responses(seed: int = 0):
@@ -201,3 +206,92 @@ def test_gradient_response_collector_mlp_and_attention(tmp_path):
     assert cache.unit_counts["attention"][0] == 2
     assert np.unique(cache.events).size == 2
     assert np.isfinite(cache.losses).all()
+    for module_name in ALL_LINEAR_MODULES:
+        scale = cache.load_activation_scale(0, module_name)
+        assert scale.shape == (getattr(getattr(model.model.layers[0], module_name.split('.')[0]), module_name.split('.')[1]).in_features,)
+        assert np.isfinite(scale).all()
+        assert np.all(scale >= 0)
+
+
+class FakeResponseCache:
+    def __init__(self, model):
+        self.attention_layouts = {
+            layer_id: {"num_heads": 2, "num_key_value_heads": 2, "head_dim": 2}
+            for layer_id, _ in enumerate(model.model.layers)
+        }
+        self.scales = {}
+        for layer_id, layer in enumerate(model.model.layers):
+            for module_name in ALL_LINEAR_MODULES:
+                module = layer
+                for part in module_name.split("."):
+                    module = getattr(module, part)
+                self.scales[(layer_id, module_name)] = np.linspace(0.5, 1.5, module.in_features).astype(np.float32)
+
+    def load_activation_scale(self, layer_id, module_name):
+        return self.scales[(layer_id, module_name)]
+
+
+def _toy_scores(model, reverse=False):
+    result = {"mlp": {}, "attention": {}}
+    for layer_id, layer in enumerate(model.model.layers):
+        mlp = np.arange(layer.mlp.down_proj.in_features, dtype=np.float32)
+        attn = np.arange(layer.self_attn.num_heads, dtype=np.float32)
+        if reverse:
+            mlp = mlp[::-1].copy()
+            attn = attn[::-1].copy()
+        result["mlp"][layer_id] = mlp
+        result["attention"][layer_id] = attn
+    return result
+
+
+def test_row_budget_is_exact_and_score_aware():
+    scores = np.arange(6, dtype=np.float32)
+    counts = allocate_row_prune_counts(
+        scores, rows_per_unit=1, columns=10, target_ratio=0.5, spread=0.8, temperature=2.0
+    )
+    assert counts.sum() == 30
+    assert counts[0] > counts[-1]
+
+
+def test_wanda_weight_masks_cover_attention_and_mlp():
+    torch.manual_seed(1)
+    model = ToyModel()
+    cache = FakeResponseCache(model)
+    summaries = apply_paper_wanda_weight_masks_(
+        model,
+        _toy_scores(model),
+        cache,
+        targets=("mlp", "attention"),
+        mlp_ratio=0.5,
+        attention_ratio=0.5,
+        chunk_rows=2,
+    )
+    assert len(summaries) == 2 * 7
+    for layer in model.model.layers:
+        for module_name in ALL_LINEAR_MODULES:
+            module = layer
+            for part in module_name.split("."):
+                module = getattr(module, part)
+            ratio = float((module.weight == 0).sum().item()) / module.weight.numel()
+            assert abs(ratio - 0.5) <= 1.0 / module.weight.numel()
+
+
+def test_paper_scores_change_wanda_weight_masks():
+    torch.manual_seed(7)
+    left = ToyModel()
+    torch.manual_seed(7)
+    right = ToyModel()
+    apply_paper_wanda_weight_masks_(
+        left, _toy_scores(left), FakeResponseCache(left), ("mlp", "attention"), 0.5, 0.5, chunk_rows=2
+    )
+    apply_paper_wanda_weight_masks_(
+        right, _toy_scores(right, reverse=True), FakeResponseCache(right), ("mlp", "attention"), 0.5, 0.5, chunk_rows=2
+    )
+    differences = 0
+    for left_layer, right_layer in zip(left.model.layers, right.model.layers):
+        for module_name in ALL_LINEAR_MODULES:
+            a, b = left_layer, right_layer
+            for part in module_name.split("."):
+                a, b = getattr(a, part), getattr(b, part)
+            differences += int(torch.count_nonzero((a.weight == 0) != (b.weight == 0)).item())
+    assert differences > 0
