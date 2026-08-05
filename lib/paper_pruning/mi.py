@@ -1,139 +1,26 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import lru_cache
+from math import gamma, pi
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy.fft import dct
 from scipy.special import digamma
 
-try:
-    from numba import njit
-except Exception:  # pragma: no cover - optional acceleration dependency
-    njit = None
-
 from .config import FrequencyConfig
-
-
-if njit is not None:
-    @njit(cache=True, nogil=True)
-    def _numba_knn_mi_small(
-        x: np.ndarray,
-        y: np.ndarray,
-        k_neighbors: int,
-        digamma_lookup: np.ndarray,
-    ) -> np.ndarray:
-        """Exact small-feature implementation of the primary estimator.
-
-        This follows the same radii, jitter, neighbor counts and digamma formula
-        as :func:`estimate_knn_mi_matrix`, but uses compiled loops to avoid the
-        allocation overhead of millions of tiny N x N x B tensors.
-        """
-        n_samples, n_features = x.shape
-        result = np.zeros(n_features, dtype=np.float64)
-        max_class = 0
-        for sample in range(n_samples):
-            if y[sample] > max_class:
-                max_class = y[sample]
-        counts = np.zeros(max_class + 1, dtype=np.int64)
-        for sample in range(n_samples):
-            counts[y[sample]] += 1
-        if counts.size < 2:
-            return result
-        minimum = n_samples
-        active_classes = 0
-        for class_id in range(counts.size):
-            if counts[class_id] > 0:
-                active_classes += 1
-                if counts[class_id] < minimum:
-                    minimum = counts[class_id]
-        if active_classes < 2 or minimum < 2:
-            return result
-
-        class_counts = np.empty(n_samples, dtype=np.int64)
-        k_per_sample = np.empty(n_samples, dtype=np.int64)
-        mean_digamma_k = 0.0
-        mean_digamma_class = 0.0
-        for sample in range(n_samples):
-            count = counts[y[sample]]
-            class_counts[sample] = count
-            k_value = min(k_neighbors, count - 1)
-            k_per_sample[sample] = k_value
-            mean_digamma_k += digamma_lookup[k_value]
-            mean_digamma_class += digamma_lookup[count]
-        constant_term = (
-            digamma_lookup[n_samples]
-            + mean_digamma_k / n_samples
-            - mean_digamma_class / n_samples
-        )
-
-        scratch = np.empty(max(1, n_samples - 1), dtype=np.float64)
-        column = np.empty(n_samples, dtype=np.float64)
-        for feature in range(n_features):
-            mean = 0.0
-            for sample in range(n_samples):
-                mean += x[sample, feature]
-            mean /= n_samples
-            variance = 0.0
-            for sample in range(n_samples):
-                delta = x[sample, feature] - mean
-                variance += delta * delta
-            variance /= n_samples
-            if variance <= 1e-14:
-                continue
-            scale = max(np.sqrt(variance), 1.0)
-            for sample in range(n_samples):
-                column[sample] = (
-                    x[sample, feature]
-                    + (sample - n_samples / 2.0) * (1e-10 * scale)
-                )
-
-            neighbor_digamma_sum = 0.0
-            for sample in range(n_samples):
-                size = 0
-                for other in range(n_samples):
-                    if other != sample and y[other] == y[sample]:
-                        scratch[size] = abs(column[sample] - column[other])
-                        size += 1
-                ordered = np.sort(scratch[:size])
-                radius = ordered[k_per_sample[sample] - 1]
-                radius = np.nextafter(radius, 0.0)
-                neighbor_count = 0
-                for other in range(n_samples):
-                    if abs(column[sample] - column[other]) <= radius:
-                        neighbor_count += 1
-                neighbor_count -= 1
-                if neighbor_count < 1:
-                    neighbor_count = 1
-                neighbor_digamma_sum += digamma_lookup[neighbor_count + 1]
-            estimate = constant_term - neighbor_digamma_sum / n_samples
-            if np.isfinite(estimate) and estimate > 0.0:
-                result[feature] = estimate
-        return result
-else:
-    _numba_knn_mi_small = None
-
-
-@lru_cache(maxsize=16)
-def _integer_digamma_lookup(maximum: int) -> np.ndarray:
-    values = np.asarray(digamma(np.arange(maximum + 1, dtype=np.float64)), dtype=np.float64)
-    values[0] = 0.0
-    return values
 
 
 @dataclass
 class FrequencySpectrum:
-    """Frequency-domain task-contribution spectrum for one transformer layer."""
-
-    fine_energy: np.ndarray          # [N, U, Q]
-    band_energy: np.ndarray          # [N, U, B]
+    fine_energy: np.ndarray          # [N,U,Q]
+    band_energy: np.ndarray          # [N,U,B]
     band_ranges: List[Tuple[int, int]]
-    band_mi: np.ndarray              # primary kNN MI [U, B]
-    band_mi_kde: np.ndarray          # auxiliary KDE MI [U, B]
-    total_mi: np.ndarray             # primary total [U]
-    probe_indices: np.ndarray        # representative units used for band merging
-    fine_relevance: np.ndarray       # probe MI per fine bin
+    band_mi: np.ndarray              # primary KL/kNN estimator [U,B]
+    band_mi_kde: np.ndarray          # auxiliary KDE estimator [U,B]
+    total_mi: np.ndarray             # weighted primary score [U]
+    probe_indices: np.ndarray
+    fine_relevance: np.ndarray
 
 
 def encode_events(events: np.ndarray) -> np.ndarray:
@@ -147,35 +34,93 @@ def encode_events(events: np.ndarray) -> np.ndarray:
 
 
 def standardize_responses(responses: np.ndarray, eps: float) -> np.ndarray:
-    """Equation (1)/(4): sample-wise, unit-wise sequence standardization."""
+    """Per-sample, per-unit standardization in the sequence dimension."""
     x = np.asarray(responses, dtype=np.float32)
     if x.ndim != 3:
-        raise ValueError(f"responses must be [samples, units, sequence], got {x.shape}")
+        raise ValueError(f"responses must be [samples,units,sequence], got {x.shape}")
     mean = x.mean(axis=-1, keepdims=True, dtype=np.float32)
     std = x.std(axis=-1, keepdims=True, dtype=np.float32)
     return (x - mean) / (std + eps)
 
 
+def proposal_dct(responses: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    """Unnormalised proposal DCT-II.
+
+    SciPy's unnormalised DCT-II is twice the cosine sum written in the proposal,
+    therefore division by two reproduces its displayed equation.
+    """
+    standardized = standardize_responses(responses, eps)
+    return np.asarray(dct(standardized, type=2, axis=-1, norm=None, workers=1) / 2.0, dtype=np.float32)
+
+
 def dct_frequency_energy(responses: np.ndarray, cfg: FrequencyConfig) -> np.ndarray:
-    """Equations (2)-(3)/(5)-(7): DCT-II, squared energy, fine-bin sum."""
-    standardized = standardize_responses(responses, cfg.eps)
-    coefficients = dct(standardized, type=2, axis=-1, norm="ortho", workers=1)
-    frequency_indices = [
-        idx for idx in np.array_split(
+    """DCT coefficients, squared energy, and contiguous fine-bin sums."""
+    coefficients = proposal_dct(responses, cfg.eps)
+    groups = [
+        group for group in np.array_split(
             np.arange(coefficients.shape[-1]),
             min(cfg.fine_bins, coefficients.shape[-1]),
-        ) if idx.size
+        ) if group.size
     ]
-    energy = np.stack(
+    return np.stack(
         [
-            np.square(coefficients[..., idx], dtype=np.float32).sum(
-                axis=-1, dtype=np.float32
-            )
-            for idx in frequency_indices
+            np.square(coefficients[..., group], dtype=np.float32).sum(axis=-1, dtype=np.float32)
+            for group in groups
         ],
         axis=-1,
+    ).astype(np.float32, copy=False)
+
+
+def _kth_neighbor_radius_1d(values: np.ndarray, k_neighbors: int) -> np.ndarray:
+    """Exact kth-neighbour radius for each scalar feature using sorted samples."""
+    x = np.asarray(values, dtype=np.float64)
+    n_samples, n_features = x.shape
+    if n_samples <= k_neighbors:
+        return np.zeros_like(x)
+    scale = np.maximum(np.std(x, axis=0), 1.0)
+    jitter = (
+        np.arange(n_samples, dtype=np.float64)[:, None] - n_samples / 2.0
+    ) * (1e-12 * scale[None, :])
+    order = np.argsort(x + jitter, axis=0, kind="stable")
+    sorted_x = np.take_along_axis(x + jitter, order, axis=0)
+    candidates = []
+    for offset in range(1, k_neighbors + 1):
+        left = np.full((n_samples, n_features), np.inf, dtype=np.float64)
+        right = np.full((n_samples, n_features), np.inf, dtype=np.float64)
+        left[offset:] = sorted_x[offset:] - sorted_x[:-offset]
+        right[:-offset] = sorted_x[offset:] - sorted_x[:-offset]
+        candidates.extend([left, right])
+    stacked = np.stack(candidates, axis=0)
+    kth_sorted = np.partition(stacked, k_neighbors - 1, axis=0)[k_neighbors - 1]
+    radii = np.empty_like(kth_sorted)
+    np.put_along_axis(radii, order, kth_sorted, axis=0)
+    return radii
+
+
+def _kl_entropy_1d_matrix(values: np.ndarray, k_neighbors: int, eps: float = 1e-12) -> np.ndarray:
+    """Kozachenko-Leonenko entropy for independent scalar feature columns."""
+    x = np.asarray(values, dtype=np.float64)
+    if x.ndim == 1:
+        x = x[:, None]
+    n_samples, n_features = x.shape
+    result = np.zeros(n_features, dtype=np.float64)
+    if n_samples < 2:
+        return result
+    k = min(int(k_neighbors), n_samples - 1)
+    active = np.var(x, axis=0) > 1e-14
+    if not np.any(active):
+        return result
+    radii = _kth_neighbor_radius_1d(x[:, active], k)
+    # Detailed equation (29), with d=1 and V_1=2.
+    entropy = (
+        digamma(n_samples)
+        - digamma(k)
+        + np.log(2.0)
+        + np.mean(np.log(np.maximum(radii, eps)), axis=0)
     )
-    return np.asarray(energy, dtype=np.float32)
+    entropy = np.where(np.isfinite(entropy), entropy, 0.0)
+    result[active] = entropy
+    return result
 
 
 def estimate_knn_mi_matrix(
@@ -184,76 +129,43 @@ def estimate_knn_mi_matrix(
     cfg: FrequencyConfig,
     feature_chunk_size: int = 256,
 ) -> np.ndarray:
-    """Ross/Kraskov-style kNN MI for continuous variables and discrete events.
+    """Entropy-decomposition kNN MI from detailed equations (28)-(29).
 
-    This is the primary estimator used for contribution spectra and ranking.
-    It is vectorized over features and chunked to bound the N x N x features
-    temporary tensor.
+    Each column is one continuous response variable Z. The estimator computes
+    H(Z)-sum_c p(c)H(Z|Y=c) with a Kozachenko-Leonenko entropy estimate.
     """
     x = np.asarray(values, dtype=np.float64)
     y = encode_events(events)
     if x.ndim == 1:
         x = x[:, None]
     if x.ndim != 2 or x.shape[0] != y.size:
-        raise ValueError("values must have shape [samples, units]")
-    n_samples, n_units = x.shape
-    result = np.zeros(n_units, dtype=np.float64)
-    classes, encoded, counts = np.unique(y, return_inverse=True, return_counts=True)
-    if n_samples < 4 or classes.size < 2 or counts.min() < 2:
+        raise ValueError("values must have shape [samples,features]")
+    result = np.zeros(x.shape[1], dtype=np.float64)
+    classes, counts = np.unique(y, return_counts=True)
+    if x.shape[0] < 4 or classes.size < 2 or counts.min() < 2:
         return result
 
-    if (
-        cfg.fast_small_mi
-        and _numba_knn_mi_small is not None
-        and n_units <= cfg.fast_small_mi_max_features
-        and n_samples <= cfg.fast_small_mi_max_samples
-    ):
-        lookup = _integer_digamma_lookup(n_samples + 1)
-        return _numba_knn_mi_small(
-            np.ascontiguousarray(x, dtype=np.float64),
-            np.ascontiguousarray(y, dtype=np.int64),
-            int(cfg.mi_neighbors),
-            lookup,
-        )
-
-    class_counts = counts[encoded]
-    k_per_sample = np.minimum(int(cfg.mi_neighbors), class_counts - 1).astype(np.int64)
-    same_class = encoded[:, None] == encoded[None, :]
-    np.fill_diagonal(same_class, False)
-    constant_term = (
-        digamma(n_samples)
-        + np.mean(digamma(k_per_sample))
-        - np.mean(digamma(class_counts))
-    )
-
-    for start in range(0, n_units, feature_chunk_size):
-        end = min(start + feature_chunk_size, n_units)
-        chunk = x[:, start:end].copy()
-        variance = np.var(chunk, axis=0)
-        active = variance > 1e-14
-        if not np.any(active):
-            continue
-
-        scale = np.maximum(np.std(chunk, axis=0), 1.0)
-        jitter = (
-            np.arange(n_samples, dtype=np.float64)[:, None] - n_samples / 2.0
-        ) * (1e-10 * scale[None, :])
-        chunk += jitter
-        distances = np.abs(chunk[:, None, :] - chunk[None, :, :])
-        same_distances = np.where(same_class[:, :, None], distances, np.inf)
-        radii = np.empty((n_samples, end - start), dtype=np.float64)
-        for sample in range(n_samples):
-            kth = int(k_per_sample[sample] - 1)
-            radii[sample] = np.partition(same_distances[sample], kth, axis=0)[kth]
-        radii = np.nextafter(radii, 0.0)
-        neighbor_counts = np.sum(distances <= radii[:, None, :], axis=1) - 1
-        neighbor_counts = np.maximum(neighbor_counts, 1)
-        estimates = constant_term - np.mean(digamma(neighbor_counts + 1), axis=0)
-        estimates = np.where(
-            active & np.isfinite(estimates), np.maximum(estimates, 0.0), 0.0
-        )
-        result[start:end] = estimates
+    for start in range(0, x.shape[1], feature_chunk_size):
+        end = min(start + feature_chunk_size, x.shape[1])
+        chunk = x[:, start:end]
+        total_entropy = _kl_entropy_1d_matrix(chunk, cfg.mi_neighbors)
+        conditional = np.zeros(end - start, dtype=np.float64)
+        for class_id, count in zip(classes, counts):
+            class_values = chunk[y == class_id]
+            class_k = min(cfg.mi_neighbors, int(count) - 1)
+            conditional += (count / y.size) * _kl_entropy_1d_matrix(class_values, class_k)
+        estimate = total_entropy - conditional
+        result[start:end] = np.where(np.isfinite(estimate), np.maximum(estimate, 0.0), 0.0)
     return result
+
+
+def _silverman_bandwidth(values: np.ndarray, scale: float) -> np.ndarray:
+    n = values.shape[0]
+    std = np.std(values, axis=0)
+    iqr = np.subtract(*np.percentile(values, [75, 25], axis=0))
+    robust = np.where(iqr > 0, np.minimum(std, iqr / 1.349), std)
+    robust = np.where(robust > 1e-10, robust, np.maximum(std, 1e-3))
+    return np.maximum(scale * 0.9 * robust * n ** (-1.0 / 5.0), 1e-6)
 
 
 def estimate_kde_mi_matrix(
@@ -261,91 +173,51 @@ def estimate_kde_mi_matrix(
     events: np.ndarray,
     cfg: FrequencyConfig,
     bandwidth: Optional[np.ndarray | float] = None,
-    feature_chunk_size: int = 256,
+    feature_chunk_size: int = 128,
 ) -> np.ndarray:
-    """Auxiliary Gaussian-KDE MI estimator.
-
-    Inside a granular ball, ``bandwidth`` can be tied to the ball radius, as
-    required by the detailed proposal. The auxiliary estimator is reported for
-    consistency checks but does not get averaged into the primary ranking.
-    """
+    """Gaussian-KDE auxiliary MI estimator, including ball-radius bandwidth."""
     x = np.asarray(values, dtype=np.float64)
     y = encode_events(events)
     if x.ndim == 1:
         x = x[:, None]
     if x.ndim != 2 or x.shape[0] != y.size:
-        raise ValueError("values must have shape [samples, units]")
-    n_samples, n_units = x.shape
-    result = np.zeros(n_units, dtype=np.float64)
+        raise ValueError("values must have shape [samples,features]")
+    n_samples, n_features = x.shape
+    result = np.zeros(n_features, dtype=np.float64)
     classes, encoded, counts = np.unique(y, return_inverse=True, return_counts=True)
     if n_samples < 4 or classes.size < 2 or counts.min() < 2:
         return result
     class_counts = counts[encoded]
-    same_class_with_self = encoded[:, None] == encoded[None, :]
+    same_class = encoded[:, None] == encoded[None, :]
 
-    if bandwidth is not None:
+    if bandwidth is None:
+        bw_all = None
+    else:
         bw_all = np.asarray(bandwidth, dtype=np.float64)
         if bw_all.ndim == 0:
-            bw_all = np.full(n_units, float(bw_all), dtype=np.float64)
-        if bw_all.size != n_units:
-            raise ValueError("bandwidth must be scalar or have one value per feature")
-    else:
-        bw_all = None
+            bw_all = np.full(n_features, float(bw_all), dtype=np.float64)
+        if bw_all.size != n_features:
+            raise ValueError("bandwidth must be scalar or one value per feature")
 
-    for start in range(0, n_units, feature_chunk_size):
-        end = min(start + feature_chunk_size, n_units)
+    for start in range(0, n_features, feature_chunk_size):
+        end = min(start + feature_chunk_size, n_features)
         chunk = x[:, start:end]
         active = np.var(chunk, axis=0) > 1e-14
         if not np.any(active):
             continue
-        distances = np.abs(chunk[:, None, :] - chunk[None, :, :])
-        if bw_all is None:
-            std = np.std(chunk, axis=0)
-            iqr = np.subtract(*np.percentile(chunk, [75, 25], axis=0))
-            robust_scale = np.where(iqr > 0, np.minimum(std, iqr / 1.349), std)
-            robust_scale = np.where(
-                robust_scale > 1e-10,
-                robust_scale,
-                np.maximum(np.abs(chunk.mean(axis=0)) * 1e-3, 1e-3),
-            )
-            bw = 0.9 * robust_scale * n_samples ** (-0.2)
-        else:
-            bw = bw_all[start:end]
-        bw = np.maximum(1e-4, bw * cfg.kde_bandwidth_scale)
-        normalized = distances / bw[None, None, :]
-        kernel = np.exp(-0.5 * normalized * normalized) / (
-            np.sqrt(2.0 * np.pi) * bw[None, None, :]
-        )
+        bw = _silverman_bandwidth(chunk, cfg.kde_bandwidth_scale) if bw_all is None else np.maximum(bw_all[start:end], 1e-6)
+        diff = (chunk[:, None, :] - chunk[None, :, :]) / bw[None, None, :]
+        kernel = np.exp(-0.5 * np.square(diff)) / (np.sqrt(2.0 * np.pi) * bw[None, None, :])
         marginal = kernel.mean(axis=1)
-        conditional = (
-            kernel * same_class_with_self[:, :, None]
-        ).sum(axis=1) / class_counts[:, None]
-        estimates = np.mean(
-            np.log(conditional + 1e-12) - np.log(marginal + 1e-12), axis=0
-        )
-        estimates = np.where(
-            active & np.isfinite(estimates), np.maximum(estimates, 0.0), 0.0
-        )
-        result[start:end] = estimates
+        conditional = (kernel * same_class[:, :, None]).sum(axis=1) / class_counts[:, None]
+        estimate = np.mean(np.log(conditional + 1e-12) - np.log(marginal + 1e-12), axis=0)
+        result[start:end] = np.where(active & np.isfinite(estimate), np.maximum(estimate, 0.0), 0.0)
     return result
 
 
-# Backward-compatible primary-estimator alias.
-def estimate_mi_matrix(
-    values: np.ndarray,
-    events: np.ndarray,
-    cfg: FrequencyConfig,
-    seed_offset: int = 0,
-    feature_chunk_size: int = 256,
-) -> np.ndarray:
-    del seed_offset
-    return estimate_knn_mi_matrix(values, events, cfg, feature_chunk_size)
-
-
 def choose_probe_units(fine_energy: np.ndarray, probe_count: int) -> np.ndarray:
-    """Select representative units spanning the layer response-energy range."""
     if fine_energy.ndim != 3:
-        raise ValueError("fine_energy must be [samples, units, bins]")
+        raise ValueError("fine_energy must be [samples,units,bins]")
     unit_count = fine_energy.shape[1]
     count = min(max(1, int(probe_count)), unit_count)
     activity = np.var(fine_energy, axis=(0, 2)) + np.mean(fine_energy, axis=(0, 2))
@@ -355,7 +227,10 @@ def choose_probe_units(fine_energy: np.ndarray, probe_count: int) -> np.ndarray:
 
 
 def aggregate_probe_energy(
-    fine_energy: np.ndarray, probe_indices: np.ndarray, start: int, end: int
+    fine_energy: np.ndarray,
+    probe_indices: np.ndarray,
+    start: int,
+    end: int,
 ) -> np.ndarray:
     return fine_energy[:, probe_indices, start:end].sum(axis=-1).mean(axis=1)
 
@@ -378,104 +253,72 @@ def adaptive_merge_adjacent_bins(
     cfg: FrequencyConfig,
     probe_indices: Optional[np.ndarray] = None,
 ) -> Tuple[List[Tuple[int, int]], np.ndarray, np.ndarray]:
-    """Task-relevance-driven adjacent merging, detailed equations (10)-(12).
-
-    Each round chooses the adjacent pair with the smallest information-loss
-    quantity r(left)+r(right)-r(union), and recomputes the union MI rather than
-    merely comparing neighboring scalar relevance values.
-    """
+    """Greedily merge the adjacent pair with minimum information loss."""
     y = encode_events(events)
-    probes = choose_probe_units(fine_energy, cfg.probe_units) if probe_indices is None else np.asarray(probe_indices, dtype=np.int64)
-    ranges: List[Tuple[int, int]] = [(q, q + 1) for q in range(fine_energy.shape[-1])]
-    relevance_cache: dict[Tuple[int, int], float] = {}
+    probes = (
+        choose_probe_units(fine_energy, cfg.probe_units)
+        if probe_indices is None
+        else np.asarray(probe_indices, dtype=np.int64)
+    )
+    ranges: List[Tuple[int, int]] = [(index, index + 1) for index in range(fine_energy.shape[-1])]
+    cache: dict[Tuple[int, int], float] = {}
 
-    def relevance_of(interval: Tuple[int, int]) -> float:
-        if interval not in relevance_cache:
-            relevance_cache[interval] = _range_relevance(
-                fine_energy, y, cfg, probes, interval[0], interval[1]
-            )
-        return relevance_cache[interval]
+    def relevance(interval: Tuple[int, int]) -> float:
+        if interval not in cache:
+            cache[interval] = _range_relevance(fine_energy, y, cfg, probes, interval[0], interval[1])
+        return cache[interval]
 
-    relevance = [relevance_of(interval) for interval in ranges]
-    fine_relevance = np.asarray(relevance, dtype=np.float64).copy()
-
+    values = [relevance(interval) for interval in ranges]
+    fine_relevance = np.asarray(values, dtype=np.float64).copy()
     target = min(max(1, int(cfg.target_bands)), len(ranges))
     while len(ranges) > target:
-        losses = []
-        unions = []
-        for pos in range(len(ranges) - 1):
-            union = (ranges[pos][0], ranges[pos + 1][1])
-            union_rel = relevance_of(union)
-            loss = relevance[pos] + relevance[pos + 1] - union_rel
-            losses.append(loss)
-            unions.append(union_rel)
-        pos = int(np.argmin(np.asarray(losses)))
-        ranges[pos : pos + 2] = [(ranges[pos][0], ranges[pos + 1][1])]
-        relevance[pos : pos + 2] = [unions[pos]]
+        losses, unions = [], []
+        for position in range(len(ranges) - 1):
+            union = (ranges[position][0], ranges[position + 1][1])
+            union_relevance = relevance(union)
+            losses.append(values[position] + values[position + 1] - union_relevance)
+            unions.append(union_relevance)
+        position = int(np.argmin(np.asarray(losses)))
+        if cfg.max_merge_loss is not None and losses[position] > cfg.max_merge_loss:
+            break
+        ranges[position : position + 2] = [(ranges[position][0], ranges[position + 1][1])]
+        values[position : position + 2] = [unions[position]]
     return ranges, fine_relevance, probes
 
 
-def merge_adjacent_bins(relevance: np.ndarray, target_bands: int) -> List[Tuple[int, int]]:
-    """Legacy scalar-only merging retained for external callers/tests."""
-    relevance = np.asarray(relevance, dtype=np.float64)
-    if relevance.ndim != 1 or relevance.size == 0:
-        raise ValueError("relevance must be a non-empty vector")
-    target_bands = min(max(1, int(target_bands)), relevance.size)
-    ranges: List[Tuple[int, int]] = [(i, i + 1) for i in range(relevance.size)]
-    values = relevance.tolist()
-    while len(ranges) > target_bands:
-        losses = [abs(values[i] - values[i + 1]) for i in range(len(ranges) - 1)]
-        pos = int(np.argmin(losses))
-        left, right = ranges[pos], ranges[pos + 1]
-        ranges[pos : pos + 2] = [(left[0], right[1])]
-        values[pos : pos + 2] = [(values[pos] + values[pos + 1]) / 2.0]
-    return ranges
-
-
-def aggregate_bands(
-    fine_energy: np.ndarray, ranges: Sequence[Tuple[int, int]]
-) -> np.ndarray:
+def aggregate_bands(fine_energy: np.ndarray, ranges: Sequence[Tuple[int, int]]) -> np.ndarray:
     return np.stack(
-        [
-            fine_energy[..., start:end].sum(axis=-1, dtype=np.float32)
-            for start, end in ranges
-        ],
+        [fine_energy[..., start:end].sum(axis=-1, dtype=np.float32) for start, end in ranges],
         axis=-1,
     ).astype(np.float32, copy=False)
 
 
 def calculate_band_mi(
-    band_energy: np.ndarray, events: np.ndarray, cfg: FrequencyConfig
+    band_energy: np.ndarray,
+    events: np.ndarray,
+    cfg: FrequencyConfig,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Compute all unit-band features in one estimator pass.
-
-    Each estimator treats columns independently, so flattening ``[U, B]`` is
-    algebraically identical to B separate calls while substantially reducing
-    Python overhead.
-    """
     n_samples, n_units, n_bands = band_energy.shape
-    flat = np.asarray(band_energy, dtype=np.float64).reshape(
-        n_samples, n_units * n_bands
-    )
-    knn = estimate_knn_mi_matrix(flat, events, cfg).reshape(n_units, n_bands)
-    kde = estimate_kde_mi_matrix(flat, events, cfg).reshape(n_units, n_bands)
-    return knn, kde
+    flat = np.asarray(band_energy, dtype=np.float64).reshape(n_samples, n_units * n_bands)
+    primary = estimate_knn_mi_matrix(flat, events, cfg).reshape(n_units, n_bands)
+    auxiliary = estimate_kde_mi_matrix(flat, events, cfg).reshape(n_units, n_bands)
+    return primary, auxiliary
 
 
 def normalized_band_weights(band_count: int, cfg: FrequencyConfig) -> np.ndarray:
-    if cfg.band_weights is None:
-        weights = np.ones(band_count, dtype=np.float64)
-    else:
-        weights = np.asarray(cfg.band_weights, dtype=np.float64)[:band_count]
-    total = weights.sum()
-    if total <= 0:
+    weights = (
+        np.ones(band_count, dtype=np.float64)
+        if cfg.band_weights is None
+        else np.asarray(cfg.band_weights, dtype=np.float64)[:band_count]
+    )
+    if weights.sum() <= 0:
         raise ValueError("band weights must have positive sum")
-    return weights / total
+    return weights / weights.sum()
 
 
 def weighted_total_mi(band_mi: np.ndarray, cfg: FrequencyConfig) -> np.ndarray:
     if band_mi.ndim != 2:
-        raise ValueError("band_mi must be [units, bands]")
+        raise ValueError("band_mi must be [units,bands]")
     return np.asarray(band_mi @ normalized_band_weights(band_mi.shape[1], cfg), dtype=np.float64)
 
 
@@ -492,11 +335,11 @@ def build_spectrum_from_fine_energy(
             fine_energy, y, cfg, probe_indices=probe_indices
         )
     else:
-        ranges = [(int(a), int(b)) for a, b in band_ranges]
+        ranges = [(int(start), int(end)) for start, end in band_ranges]
         probes = choose_probe_units(fine_energy, cfg.probe_units) if probe_indices is None else np.asarray(probe_indices, dtype=np.int64)
         fine_relevance = np.asarray([
-            _range_relevance(fine_energy, y, cfg, probes, q, q + 1)
-            for q in range(fine_energy.shape[-1])
+            _range_relevance(fine_energy, y, cfg, probes, index, index + 1)
+            for index in range(fine_energy.shape[-1])
         ])
     band_energy = aggregate_bands(fine_energy, ranges)
     band_mi, band_mi_kde = calculate_band_mi(band_energy, y, cfg)
@@ -513,8 +356,9 @@ def build_spectrum_from_fine_energy(
 
 
 def build_frequency_spectrum(
-    responses: np.ndarray, events: np.ndarray, cfg: FrequencyConfig
+    responses: np.ndarray,
+    events: np.ndarray,
+    cfg: FrequencyConfig,
 ) -> FrequencySpectrum:
     cfg.validate()
-    fine_energy = dct_frequency_energy(responses, cfg)
-    return build_spectrum_from_fine_energy(fine_energy, events, cfg)
+    return build_spectrum_from_fine_energy(dct_frequency_energy(responses, cfg), events, cfg)
