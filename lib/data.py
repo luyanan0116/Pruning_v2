@@ -1,138 +1,106 @@
-from __future__ import annotations
-
+# lib/data.py
 import os
 import random
-from pathlib import Path
-
 import numpy as np
 import torch
+from datasets import load_dataset, load_from_disk
+from transformers import AutoTokenizer
 
-
-def set_seed(seed: int) -> None:
+# 设置随机种子的辅助函数
+def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    torch.cuda.manual_seed_all(seed)
 
+# 1. 加载本地 WikiText-2 数据集
+def get_wikitext2(nsamples, seed, seqlen, tokenizer):
+    # 【已修改】更新为你上传并解压的本地路径
+    local_wiki_path = os.environ.get("WIKITEXT2_PATH", "/root/dw2/Lya/Pruning/dataset_wikitext-raw")
+    print(f"Loading local WikiText-2 from raw text files in: {local_wiki_path}")
+    
+    # 确定解压后的文件路径（正常解压后包含 wiki.train.raw 和 wiki.test.raw）
+    train_file = os.path.join(local_wiki_path, "wiki.train.raw")
+    test_file = os.path.join(local_wiki_path, "wiki.test.raw")
+    
+    # 兼容性处理：如果解压时自动多创建了一层 "wikitext-2-raw" 文件夹
+    if not os.path.exists(train_file):
+        train_file = os.path.join(local_wiki_path, "wikitext-2-raw", "wiki.train.raw")
+        test_file = os.path.join(local_wiki_path, "wikitext-2-raw", "wiki.test.raw")
+    
+    if not os.path.exists(train_file):
+        raise FileNotFoundError(f"找不到 wiki.train.raw 文件，请检查路径。当前尝试过的路径:\n1. {os.path.join(local_wiki_path, 'wiki.train.raw')}\n2. {train_file}")
 
-def _resolve_wikitext_files(root: str | None) -> tuple[Path, Path] | None:
-    if not root:
-        return None
-    base = Path(root)
-    candidates = [base, base / "wikitext-2-raw"]
-    for candidate in candidates:
-        train = candidate / "wiki.train.raw"
-        test = candidate / "wiki.test.raw"
-        if train.exists() and test.exists():
-            return train, test
-    raise FileNotFoundError(
-        f"WikiText-2 path {base} must contain wiki.train.raw and wiki.test.raw "
-        "directly or inside wikitext-2-raw/"
-    )
+    # 【已修改】使用 'text' 模式加载本地的 .raw 纯文本文件
+    traindata = load_dataset('text', data_files={'train': train_file}, split='train')
+    testdata = load_dataset('text', data_files={'test': test_file}, split='test')
 
-
-def get_wikitext2(nsamples: int, seed: int, seqlen: int, tokenizer):
-    from datasets import load_dataset
-    local = _resolve_wikitext_files(os.environ.get("WIKITEXT2_PATH"))
-    if local is None:
-        train_data = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
-        test_data = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
-    else:
-        train_file, test_file = local
-        train_data = load_dataset("text", data_files={"train": str(train_file)}, split="train")
-        test_data = load_dataset("text", data_files={"test": str(test_file)}, split="test")
-
-    train_encoding = tokenizer("\n\n".join(train_data["text"]), return_tensors="pt")
-    test_encoding = tokenizer("\n\n".join(test_data["text"]), return_tensors="pt")
-    if train_encoding.input_ids.shape[1] < seqlen:
-        raise ValueError("WikiText-2 train text is shorter than the requested sequence length")
+    # 后续分词与采样逻辑保持完全不变
+    trainenc = tokenizer("\n\n".join(traindata['text']), return_tensors='pt')
+    testenc = tokenizer("\n\n".join(testdata['text']), return_tensors='pt')
 
     set_seed(seed)
-    train_loader = []
-    max_start = train_encoding.input_ids.shape[1] - seqlen
+    trainloader = []
     for _ in range(nsamples):
-        start = random.randint(0, max_start)
-        inputs = train_encoding.input_ids[:, start : start + seqlen]
-        targets = inputs.clone()
-        targets[:, :-1] = -100
-        train_loader.append((inputs, targets))
-    return train_loader, test_encoding
+        max_start = trainenc.input_ids.shape[1] - seqlen
+        i = random.randint(0, max_start)
+        j = i + seqlen
+        inp = trainenc.input_ids[:, i:j]
+        tar = inp.clone()
+        tar[:, :-1] = -100
+        trainloader.append((inp, tar))
+    return trainloader, testenc
 
+# 2. 加载本地 C4 数据集
+def get_c4(nsamples, seed, seqlen, tokenizer):
+    # 本地 C4 数据集路径
+    local_c4_path = os.environ.get("C4_PATH", "/root/dw2/Lya/Pruning/dataset_c4")
+    print(f"Loading local C4 from: {local_c4_path}")
 
-def _load_local_c4(root: Path):
-    from datasets import load_dataset, load_from_disk
-    if (root / "dataset_dict.json").exists() or (root / "state.json").exists():
-        loaded = load_from_disk(str(root))
-        if hasattr(loaded, "keys") and "train" in loaded:
-            return loaded["train"], loaded.get("validation", loaded["train"])
-        return loaded, loaded
-    json_train = root / "en" / "c4-train.00000-of-01024.json.gz"
-    json_valid = root / "en" / "c4-validation.00000-of-00008.json.gz"
-    if json_train.exists() and json_valid.exists():
-        train = load_dataset("json", data_files=str(json_train), split="train")
-        valid = load_dataset("json", data_files=str(json_valid), split="train")
-        return train, valid
-    raise FileNotFoundError(
-        f"C4 path {root} is neither a datasets save_to_disk directory nor a supported en/*.json.gz layout"
-    )
-
-
-def get_c4(nsamples: int, seed: int, seqlen: int, tokenizer):
-    from datasets import load_dataset
-    local = os.environ.get("C4_PATH")
-    if local:
-        train_data, validation_data = _load_local_c4(Path(local))
+    # 自动适配：优先使用 load_from_disk，若不成功则使用 load_dataset 载入本地目录
+    if os.path.exists(os.path.join(local_c4_path, "dataset_dict.json")) or os.path.exists(os.path.join(local_c4_path, "state.json")):
+        dataset = load_from_disk(local_c4_path)
+        traindata = dataset['train']
+        valdata = dataset['validation']
     else:
-        train_data = load_dataset("allenai/c4", "en", split="train", streaming=True)
-        validation_data = load_dataset("allenai/c4", "en", split="validation", streaming=True)
+        # 如果是包含未打包 json.gz 文件的本地目录，单独指定格式载入
+        if os.path.exists(os.path.join(local_c4_path, "en")):
+            traindata = load_dataset('json', data_files={'train': os.path.join(local_c4_path, 'en/c4-train.00000-of-01024.json.gz')}, split='train')
+            valdata = load_dataset('json', data_files={'validation': os.path.join(local_c4_path, 'en/c4-validation.00000-of-00008.json.gz')}, split='validation')
+        else:
+            traindata = load_dataset(local_c4_path, split='train')
+            valdata = load_dataset(local_c4_path, split='validation')
 
     set_seed(seed)
-    train_loader = []
-    if local:
-        while len(train_loader) < nsamples:
-            row = train_data[random.randint(0, len(train_data) - 1)]
-            encoded = tokenizer(row["text"], return_tensors="pt")
-            if encoded.input_ids.shape[1] < seqlen:
-                continue
-            start = random.randint(0, encoded.input_ids.shape[1] - seqlen)
-            inputs = encoded.input_ids[:, start : start + seqlen]
-            targets = inputs.clone()
-            targets[:, :-1] = -100
-            train_loader.append((inputs, targets))
-        validation_text = " ".join(validation_data[:1100]["text"])
-    else:
-        for row in train_data:
-            encoded = tokenizer(row["text"], return_tensors="pt")
-            if encoded.input_ids.shape[1] < seqlen:
-                continue
-            start = random.randint(0, encoded.input_ids.shape[1] - seqlen)
-            inputs = encoded.input_ids[:, start : start + seqlen]
-            targets = inputs.clone()
-            targets[:, :-1] = -100
-            train_loader.append((inputs, targets))
-            if len(train_loader) >= nsamples:
+    trainloader = []
+    for _ in range(nsamples):
+        while True:
+            i = random.randint(0, len(traindata) - 1)
+            trainenc = tokenizer(traindata[i]['text'], return_tensors='pt')
+            if trainenc.input_ids.shape[1] >= seqlen:
                 break
-        validation_rows = []
-        for index, row in enumerate(validation_data):
-            validation_rows.append(row["text"])
-            if index >= 1099:
-                break
-        validation_text = " ".join(validation_rows)
+        max_start = trainenc.input_ids.shape[1] - seqlen
+        i = random.randint(0, max_start)
+        j = i + seqlen
+        inp = trainenc.input_ids[:, i:j]
+        tar = inp.clone()
+        tar[:, :-1] = -100
+        trainloader.append((inp, tar))
 
-    validation_ids = tokenizer(validation_text, return_tensors="pt").input_ids[:, : 256 * seqlen]
+    valenc = tokenizer(' '.join(valdata[:1100]['text']), return_tensors='pt')
+    valenc = valenc.input_ids[:, :(256 * seqlen)]
 
     class TokenizerWrapper:
         def __init__(self, input_ids):
             self.input_ids = input_ids
+    valenc = TokenizerWrapper(valenc)
 
-    return train_loader, TokenizerWrapper(validation_ids)
+    return trainloader, valenc
 
-
-def get_loaders(name: str, nsamples: int = 128, seed: int = 0, seqlen: int = 2048, tokenizer=None):
-    normalized = name.lower()
-    if "wikitext2" in normalized:
+# 3. 统一的数据加载器调度接口
+def get_loaders(name, nsamples=128, seed=0, seqlen=2048, tokenizer=None):
+    if 'wikitext2' in name:
         return get_wikitext2(nsamples, seed, seqlen, tokenizer)
-    if "c4" in normalized:
+    if 'c4' in name:
         return get_c4(nsamples, seed, seqlen, tokenizer)
-    raise ValueError(f"unknown dataset name: {name}")
+    raise ValueError(f"Unknown dataset name: {name}")

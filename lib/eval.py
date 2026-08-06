@@ -1,121 +1,165 @@
-from __future__ import annotations
-
-import math
-
+# Import necessary modules
+import time
 import torch
-import torch.nn.functional as F
+import torch.nn as nn
 
-from .data import get_loaders
+# Import get_loaders function from data module within the same directory
+from .data import get_loaders 
+
+from collections import defaultdict
+import fnmatch
 
 
-def _input_device(model: torch.nn.Module) -> torch.device:
-    return model.get_input_embeddings().weight.device
+# Function to evaluate perplexity (ppl) on a specified model and tokenizer
+def eval_ppl(args, model, tokenizer, device=torch.device("cuda:0")):
+    # Set dataset
+    dataset = "wikitext2"
 
+    # Print status
+    print(f"evaluating on {dataset}")
 
-def evaluate_wikitext2_ppl(
-    model: torch.nn.Module,
-    tokenizer,
-    seqlen: int,
-    batch_size: int = 1,
-) -> float:
-    """Evaluate exact next-token perplexity on WikiText-2 raw test text."""
-    if seqlen < 2 or batch_size < 1:
-        raise ValueError("seqlen must be >=2 and batch_size must be positive")
-    _, test_encoding = get_loaders(
-        "wikitext2",
-        nsamples=1,
-        seed=0,
-        seqlen=seqlen,
-        tokenizer=tokenizer,
+    # Get the test loader
+    _, testloader = get_loaders(
+        dataset, seed=0, seqlen=model.seqlen, tokenizer=tokenizer 
     )
-    token_ids = test_encoding.input_ids
-    sample_count = token_ids.numel() // seqlen
-    if sample_count < 1:
-        raise ValueError("WikiText-2 test set is shorter than one evaluation sequence")
 
-    total_nll = 0.0
-    total_tokens = 0
-    device = _input_device(model)
-    original_use_cache = getattr(model.config, "use_cache", None)
-    if original_use_cache is not None:
-        model.config.use_cache = False
-    model.eval()
-    try:
-        with torch.inference_mode():
-            for start in range(0, sample_count, batch_size):
-                stop = min(start + batch_size, sample_count)
-                inputs = token_ids[:, start * seqlen : stop * seqlen].reshape(
-                    stop - start, seqlen
-                ).to(device)
-                logits = model(input_ids=inputs, use_cache=False).logits[:, :-1, :].float()
-                labels = inputs[:, 1:].to(logits.device)
-                loss_sum = F.cross_entropy(
-                    logits.reshape(-1, logits.shape[-1]),
-                    labels.reshape(-1),
-                    reduction="sum",
-                )
-                total_nll += float(loss_sum.cpu())
-                total_tokens += int(labels.numel())
-                print(f"[PPL] sequences {stop}/{sample_count}", flush=True)
-    finally:
-        if original_use_cache is not None:
-            model.config.use_cache = original_use_cache
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    return float(math.exp(total_nll / total_tokens))
+    # Evaluate ppl in no grad context to avoid updating the model
+    with torch.no_grad():
+        ppl_test = eval_ppl_wikitext(model, testloader, 1, device)
+    return ppl_test 
+
+# Function to evaluate perplexity (ppl) specifically on the wikitext dataset
+def eval_ppl_wikitext_train(model, trainloader, bs=1, device=None):
+    # Get input IDs
+    # testenc = testenc.input_ids
+
+    # Calculate number of samples
+    # nsamples = testenc.numel() // model.seqlen
+    nsamples = len(trainloader)
+
+    # List to store negative log likelihoods
+    nlls = []
+    print(f"nsamples {nsamples}")
+
+    # Loop through each batch
+    for i in range(0,nsamples,bs):
+        if i % 50 == 0:
+            print(f"sample {i}")
+
+        # Calculate end index
+        j = min(i+bs, nsamples)
+
+        # Prepare inputs and move to device
+        # inputs = testenc[:,(i * model.seqlen):(j * model.seqlen)].to(device)
+        inputs = trainloader[i][0].to(device)
+        inputs = inputs.reshape(j-i, model.seqlen)
+
+        # Forward pass through the model
+        lm_logits = model(inputs).logits
+
+        # Shift logits and labels for next token prediction
+        shift_logits = lm_logits[:, :-1, :].contiguous()
+        shift_labels = inputs[:, 1:]
+
+        # Compute loss
+        loss_fct = nn.CrossEntropyLoss()
+        loss = loss_fct(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.reshape(-1))
+
+        # Calculate negative log likelihood
+        neg_log_likelihood = loss.float() * model.seqlen * (j-i)
+
+        # Append to list of negative log likelihoods
+        nlls.append(neg_log_likelihood)
+
+    # Compute perplexity
+    ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
+
+    # Empty CUDA cache to save memory
+    torch.cuda.empty_cache()
+
+    return ppl.item()
+
+# Function to evaluate perplexity (ppl) specifically on the wikitext dataset
+def eval_ppl_wikitext(model, testenc, bs=1, device=None):
+    # Get input IDs
+    testenc = testenc.input_ids
+
+    # Calculate number of samples
+    nsamples = testenc.numel() // model.seqlen
+
+    # List to store negative log likelihoods
+    nlls = []
+    print(f"nsamples {nsamples}")
+
+    # Loop through each batch
+    for i in range(0,nsamples,bs):
+        if i % 50 == 0:
+            print(f"sample {i}")
+
+        # Calculate end index
+        j = min(i+bs, nsamples)
+
+        # Prepare inputs and move to device
+        inputs = testenc[:,(i * model.seqlen):(j * model.seqlen)].to(device)
+        inputs = inputs.reshape(j-i, model.seqlen)
+
+        # Forward pass through the model
+        lm_logits = model(inputs).logits
+
+        # Shift logits and labels for next token prediction
+        shift_logits = lm_logits[:, :-1, :].contiguous()
+        shift_labels = inputs[:, 1:]
+
+        # Compute loss
+        loss_fct = nn.CrossEntropyLoss()
+        loss = loss_fct(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.reshape(-1))
+
+        # Calculate negative log likelihood
+        neg_log_likelihood = loss.float() * model.seqlen * (j-i)
+
+        # Append to list of negative log likelihoods
+        nlls.append(neg_log_likelihood)
+
+    # Compute perplexity
+    ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
+
+    # Empty CUDA cache to save memory
+    torch.cuda.empty_cache()
+
+    return ppl.item()
 
 
-def evaluate_scenario_manifest_nll(
-    model: torch.nn.Module,
-    tokenizer,
-    manifest_path: str,
-    max_length: int,
-) -> dict:
-    """Evaluate causal next-token NLL/PPL per scenario in a JSON/JSONL manifest."""
-    from collections import defaultdict
+def eval_zero_shot(model_name, model, tokenizer, task_list=["boolq","rte","hellaswag","winogrande","arc_challenge","arc_easy","openbookqa"], 
+        num_fewshot=0, use_accelerate=False, add_special_tokens=False):
+    from lm_eval import tasks, evaluator 
+    def pattern_match(patterns, source_list):
+        task_names = set()
+        for pattern in patterns:
+            for matching in fnmatch.filter(source_list, pattern):
+                task_names.add(matching)
+        return list(task_names)
+    task_names = pattern_match(task_list, tasks.ALL_TASKS)
+    model_args = f"pretrained={model_name},cache_dir=./llm_weights"
+    limit = None 
+    if "70b" in model_name or "65b" in model_name:
+        limit = 2000
+    if use_accelerate:
+        model_args = f"pretrained={model_name},cache_dir=./llm_weights,use_accelerate=True"
+    results = evaluator.simple_evaluate(
+        model="hf-causal-experimental",
+        model_args=model_args,
+        tasks=task_names,
+        num_fewshot=num_fewshot,
+        batch_size=None,
+        device=None,
+        no_cache=True,
+        limit=limit,
+        description_dict={},
+        decontamination_ngrams_path=None,
+        check_integrity=False,
+        pretrained_model=model,
+        tokenizer=tokenizer, 
+        add_special_tokens=add_special_tokens
+    )
 
-    from .paper_pruning.scenarios import load_scenario_manifest
-
-    records = load_scenario_manifest(manifest_path, tokenizer, max_length=max_length, limit=None)
-    totals = defaultdict(float)
-    counts = defaultdict(int)
-    device = _input_device(model)
-    original_use_cache = getattr(model.config, "use_cache", None)
-    if original_use_cache is not None:
-        model.config.use_cache = False
-    try:
-        model.eval()
-        with torch.inference_mode():
-            for record in records:
-                inputs = record["input_ids"].to(device)
-                logits = model(input_ids=inputs, use_cache=False).logits[:, :-1, :].float()
-                labels = inputs[:, 1:].to(logits.device)
-                loss_sum = F.cross_entropy(
-                    logits.reshape(-1, logits.shape[-1]),
-                    labels.reshape(-1),
-                    reduction="sum",
-                )
-                key = str(record.get("scenario_id", "manifest"))
-                totals[key] += float(loss_sum.cpu())
-                counts[key] += int(labels.numel())
-    finally:
-        if original_use_cache is not None:
-            model.config.use_cache = original_use_cache
-    per_scenario = {
-        key: {
-            "tokens": counts[key],
-            "mean_nll": totals[key] / counts[key],
-            "ppl": math.exp(totals[key] / counts[key]),
-        }
-        for key in sorted(totals)
-    }
-    total_nll = sum(totals.values())
-    total_tokens = sum(counts.values())
-    return {
-        "overall": {
-            "tokens": total_tokens,
-            "mean_nll": total_nll / total_tokens,
-            "ppl": math.exp(total_nll / total_tokens),
-        },
-        "per_scenario": per_scenario,
-    }
+    return results 

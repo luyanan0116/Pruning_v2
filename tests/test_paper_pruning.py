@@ -1,277 +1,178 @@
 from __future__ import annotations
 
-import json
-from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
-import pytest
 import torch
-from scipy.fft import dct
-from torch import nn
 
-from lib.paper_pruning.apply import zero_attention_heads_, zero_mlp_channels_
+from lib.paper_pruning.apply import zero_attention_heads_, zero_mlp_channels_, zero_structured_units_
 from lib.paper_pruning.collector import collect_gradient_response_cache
-from lib.paper_pruning.config import (
-    BudgetConfig,
-    FrequencyConfig,
-    GranularBallConfig,
-    LCBConfig,
-    PipelineConfig,
-)
-from lib.paper_pruning.global_budget import coverage_aware_multi_budget_indices
-from lib.paper_pruning.materialize import materialize_structured_units_
+from lib.paper_pruning.config import FrequencyConfig, GranularBallConfig, LCBConfig, PipelineConfig
 from lib.paper_pruning.granular_ball import (
-    granularity_weights_from_repeat_variance,
-    unit_localization_features,
+    build_multigranularity_hierarchy,
+    layer_localization_features,
+    multi_granularity_local_mi,
 )
-from lib.paper_pruning.mi import (
-    adaptive_merge_adjacent_bins,
-    dct_frequency_energy,
-    estimate_knn_mi_matrix,
-    proposal_dct,
-)
+from lib.paper_pruning.mi import build_frequency_spectrum, estimate_knn_mi_matrix
 from lib.paper_pruning.pipeline import score_layer
-from lib.paper_pruning.scenarios import load_scenario_manifest
+from lib.paper_pruning.selection import resolve_prune_count, select_bottom_k, split_into_steps
+from lib.paper_pruning.wanda_weight import (
+    ALL_LINEAR_MODULES,
+    allocate_row_prune_counts,
+    apply_paper_wanda_weight_masks_,
+)
 
 
-def test_proposal_dct_matches_displayed_cosine_sum():
-    rng = np.random.default_rng(0)
-    responses = rng.normal(size=(3, 2, 12)).astype(np.float32)
-    standardized = (responses - responses.mean(-1, keepdims=True)) / (
-        responses.std(-1, keepdims=True) + 1e-8
-    )
-    manual = np.zeros_like(standardized)
-    length = standardized.shape[-1]
-    for k in range(length):
-        cosine = np.cos(np.pi * (2 * np.arange(length) + 1) * k / (2 * length))
-        manual[..., k] = np.sum(standardized * cosine, axis=-1)
-    assert np.allclose(proposal_dct(responses), manual, atol=2e-5)
-    assert np.allclose(proposal_dct(responses), dct(standardized, type=2, axis=-1) / 2, atol=2e-5)
-
-
-def test_frequency_energy_is_squared_and_binned():
-    responses = np.asarray([[[1.0, 0.0, -1.0, 0.0, 1.0, 0.0, -1.0, 0.0]]])
-    cfg = FrequencyConfig(fine_bins=4, target_bands=2)
-    coefficients = proposal_dct(responses, cfg.eps)
-    groups = np.array_split(np.arange(8), 4)
-    expected = np.stack([(coefficients[..., group] ** 2).sum(-1) for group in groups], axis=-1)
-    assert np.allclose(dct_frequency_energy(responses, cfg), expected)
-
-
-def test_entropy_decomposition_mi_detects_dependency():
-    rng = np.random.default_rng(1)
-    events = np.repeat([0, 1], 100)
-    dependent = events + rng.normal(scale=0.12, size=events.size)
-    independent = rng.normal(size=events.size)
-    values = np.column_stack([dependent, independent])
-    estimates = estimate_knn_mi_matrix(values, events, FrequencyConfig(mi_neighbors=4))
-    assert estimates[0] > estimates[1] + 0.15
-    assert np.all(estimates >= 0)
-
-
-def test_adaptive_merge_uses_probe_information_loss():
-    rng = np.random.default_rng(2)
-    samples, units, bins = 80, 6, 8
-    events = np.repeat([0, 1], samples // 2)
-    energy = rng.gamma(2.0, 0.2, size=(samples, units, bins)).astype(np.float32)
-    energy[events == 1, :, :2] += 2.5
-    ranges, relevance, probes = adaptive_merge_adjacent_bins(
-        energy,
-        events,
-        FrequencyConfig(fine_bins=bins, target_bands=3, probe_units=4, mi_neighbors=3),
-    )
-    assert len(ranges) == 3
-    assert ranges[0][0] == 0 and ranges[-1][1] == bins
-    assert all(ranges[index][1] == ranges[index + 1][0] for index in range(len(ranges) - 1))
-    assert relevance.shape == (bins,)
-    assert 1 <= probes.size <= units
-
-
-def _synthetic_responses(seed: int = 3):
+def synthetic_responses(seed: int = 0):
     rng = np.random.default_rng(seed)
-    samples, units, length = 48, 5, 32
-    base_ids = np.repeat(np.arange(12), 4)
-    scenarios = np.tile(np.arange(4), 12)
-    events = ((base_ids + scenarios) % 2).astype(np.int64)
-    t = np.arange(length)
-    responses = rng.normal(scale=0.25, size=(samples, units, length))
-    low = np.cos(np.pi * t / length)
-    high = np.cos(np.pi * 12 * (2 * t + 1) / (2 * length))
-    responses[:, 0, :] += np.where(events[:, None] == 0, low, high)
-    responses[:, 1, :] += np.where(events[:, None] == 0, high, low)
-    return responses.astype(np.float32), events, scenarios, base_ids
+    n, units, length = 72, 24, 32
+    events = np.repeat(np.arange(3), n // 3)
+    scenarios = np.tile(np.arange(3), n // 3)
+    x = rng.normal(0, 0.35, size=(n, units, length)).astype(np.float32)
+    t = np.linspace(0, 2 * np.pi, length, endpoint=False)
+    for unit in range(units):
+        if unit < 8:
+            x[:, unit] += events[:, None] * np.sin(t)[None, :] * (0.15 + unit / 40)
+        elif unit < 16:
+            x[:, unit] += (events == 2)[:, None] * np.cos(4 * t)[None, :] * 0.6
+        else:
+            x[:, unit] += scenarios[:, None] * np.cos(2 * t)[None, :] * 0.25
+    return x, events, scenarios
 
 
-def test_full_scoring_pipeline_outputs_granular_and_lcb_scores():
-    responses, events, scenarios, base_ids = _synthetic_responses()
-    config = PipelineConfig(
-        frequency=FrequencyConfig(
-            fine_bins=8,
-            target_bands=3,
-            mi_neighbors=2,
-            probe_units=3,
-        ),
+def test_frequency_spectrum_and_selection():
+    x, events, _ = synthetic_responses()
+    cfg = FrequencyConfig(fine_bins=8, target_bands=4, mi_neighbors=3)
+    spectrum = build_frequency_spectrum(x, events, cfg)
+    assert spectrum.band_energy.shape == (72, 24, 4)
+    assert spectrum.band_mi.shape == (24, 4)
+    assert np.isfinite(spectrum.total_mi).all()
+    chosen = select_bottom_k(spectrum.total_mi, 5)
+    assert chosen.shape == (5,)
+    assert len(split_into_steps(chosen, 2)) == 3
+    assert resolve_prune_count(24, 0.25, 0) == 6
+    assert resolve_prune_count(24, 0.25, 7) == 7
+
+
+def test_purity_thresholds_create_nested_ball_counts():
+    x, events, _ = synthetic_responses(1)
+    spectrum = build_frequency_spectrum(x, events, FrequencyConfig(fine_bins=8, target_bands=4))
+    features = layer_localization_features(spectrum.band_energy)
+    cfg = GranularBallConfig(
+        purity_thresholds=(0.55, 0.65, 0.75),
+        min_ball_size=6,
+        max_balls=20,
+        min_event_classes=1,
+    )
+    hierarchy = build_multigranularity_hierarchy(features, events, cfg)
+    counts = [len(balls) for _, balls in hierarchy]
+    assert counts == sorted(counts)
+    assert counts[-1] >= counts[0]
+    assert all(0.0 <= ball.purity <= 1.0 for _, balls in hierarchy for ball in balls)
+
+
+def test_three_ablation_paths_and_lcb_variance():
+    x, events, scenarios = synthetic_responses(2)
+    cfg = PipelineConfig(
+        frequency=FrequencyConfig(fine_bins=8, target_bands=4, mi_neighbors=2, random_state=4),
         granular_ball=GranularBallConfig(
-            purity_thresholds=(0.60, 0.75),
-            min_ball_size=4,
-            max_balls=8,
-            max_depth=3,
-            workers=1,
-            kde_scope="none",
+            purity_thresholds=(0.55, 0.65, 0.75),
+            min_ball_size=6,
+            max_balls=16,
+            min_event_classes=1,
         ),
-        lcb=LCBConfig(
-            repeats=3,
-            sample_fraction=0.8,
-            scenario_fraction=0.75,
-            lcb_lambda=1.0,
-            workers=1,
-        ),
-        budget=BudgetConfig(coverage_ratio=0.8, coverage_alpha=0.2),
+        lcb=LCBConfig(repeats=5, sample_fraction=0.75, lcb_lambda=1.0, random_state=7),
     )
-    result = score_layer(
-        responses,
-        events,
-        scenarios,
-        config,
-        layer_id=0,
-        base_sample_ids=base_ids,
-    )
-    assert result.mi_score.shape == (responses.shape[1],)
-    assert result.granular_band_mi.shape == (responses.shape[1], 3)
-    assert result.bootstrap_scores.shape == (3, responses.shape[1])
-    assert result.bootstrap_level_band_scores.shape[:3] == (3, 2, responses.shape[1])
-    assert np.isclose(result.granularity_weights.sum(), 1.0)
-    assert np.allclose(result.lcb_score, result.lcb_mean - result.lcb_std)
-    assert result.global_spectrum.band_ranges
+    result = score_layer(x, events, scenarios, cfg, layer_id=3)
+    assert result.bootstrap_scores.shape == (5, 24)
+    assert np.any(result.lcb_std > 0)
+    assert not np.allclose(result.mi_score, result.granular_score)
+    assert not np.allclose(result.granular_score, result.lcb_score)
 
 
-
-def test_particle_space_uses_literal_raw_band_response_vectors():
-    values = np.asarray([[1.0, 10.0], [3.0, 40.0], [8.0, 90.0]])
-    assert np.array_equal(unit_localization_features(values), values)
-
-
-def test_variance_adaptive_fusion_prefers_stable_granularity():
-    rng = np.random.default_rng(123)
-    stable = 1.0 + rng.normal(scale=0.01, size=(12, 1, 4, 3))
-    unstable = 1.0 + rng.normal(scale=0.5, size=(12, 1, 4, 3))
-    repeats = np.concatenate([stable, unstable], axis=1)
-    weights, variances = granularity_weights_from_repeat_variance(
-        repeats, GranularBallConfig(purity_thresholds=(0.60, 0.80))
-    )
-    assert variances[0] < variances[1]
-    assert weights[0] > weights[1]
-    assert np.isclose(weights.sum(), 1.0)
-
-def _brute_greedy(scores, bands, costs, limits, cfg):
-    selected = []
-    spent = np.zeros(costs.shape[1])
-    coverage = np.zeros(bands.shape[1])
-    targets = cfg.coverage_ratio * bands.sum(0)
-    effective = np.mean(costs / limits[None, :], axis=1)
-    while True:
-        feasible = [
-            i for i in range(len(scores))
-            if i not in selected and np.all(spent + costs[i] <= limits + 1e-12)
-        ]
-        if not feasible:
-            break
-        under = np.maximum(0, targets - coverage)
-        gains = {
-            i: (scores[i] + cfg.coverage_alpha * bands[i].dot(under)) / effective[i]
-            for i in feasible
-        }
-        best = max(feasible, key=lambda i: (gains[i], -i))
-        if not cfg.fill_budget and np.all(coverage >= targets) and gains[best] <= 0:
-            break
-        selected.append(best)
-        spent += costs[best]
-        coverage += bands[best]
-    return np.asarray(sorted(selected)), spent, coverage / np.maximum(bands.sum(0), 1e-12)
-
-
-def test_lazy_global_greedy_matches_full_rescoring():
-    scores = np.asarray([1.2, 0.9, 0.7, 0.3, 0.2])
-    bands = np.asarray([
-        [0.9, 0.1],
-        [0.1, 0.9],
-        [0.6, 0.4],
-        [0.2, 0.7],
-        [0.5, 0.1],
-    ])
-    costs = np.asarray([
-        [2.0, 3.0],
-        [2.0, 2.0],
-        [1.0, 2.0],
-        [1.0, 1.0],
-        [1.0, 1.0],
-    ])
-    limits = np.asarray([5.0, 7.0])
-    cfg = BudgetConfig(coverage_ratio=0.55, coverage_alpha=0.4, fill_budget=True)
-    expected, expected_spent, expected_coverage = _brute_greedy(scores, bands, costs, limits, cfg)
-    keep, spent, coverage, _ = coverage_aware_multi_budget_indices(
-        scores, bands, costs, limits, cfg
-    )
-    assert np.array_equal(keep, expected)
-    assert np.allclose(spent, expected_spent)
-    assert np.allclose(coverage, expected_coverage)
-    assert np.all(spent <= limits + 1e-12)
-
-
-class FakeAttention(nn.Module):
-    def __init__(self, hidden: int = 8, heads: int = 2):
+class ToyMLP(torch.nn.Module):
+    def __init__(self, hidden=4, intermediate=6):
         super().__init__()
-        self.num_heads = heads
-        self.num_key_value_heads = heads
-        self.head_dim = hidden // heads
-        self.q_proj = nn.Linear(hidden, hidden, bias=False)
-        self.k_proj = nn.Linear(hidden, hidden, bias=False)
-        self.v_proj = nn.Linear(hidden, hidden, bias=False)
-        self.o_proj = nn.Linear(hidden, hidden, bias=False)
+        self.gate_proj = torch.nn.Linear(hidden, intermediate, bias=True)
+        self.up_proj = torch.nn.Linear(hidden, intermediate, bias=True)
+        self.down_proj = torch.nn.Linear(intermediate, hidden, bias=False)
+
+
+class ToyAttention(torch.nn.Module):
+    def __init__(self, hidden=4, num_heads=2):
+        super().__init__()
+        self.num_heads = num_heads
+        self.num_key_value_heads = num_heads
+        self.head_dim = hidden // num_heads
+        self.q_proj = torch.nn.Linear(hidden, hidden, bias=True)
+        self.k_proj = torch.nn.Linear(hidden, hidden, bias=True)
+        self.v_proj = torch.nn.Linear(hidden, hidden, bias=True)
+        self.o_proj = torch.nn.Linear(hidden, hidden, bias=False)
 
     def forward(self, x):
-        return self.o_proj(x)
+        # The collector only needs a differentiable, head-concatenated o_proj input.
+        mixed = (self.q_proj(x) + self.k_proj(x) + self.v_proj(x)) / 3
+        return self.o_proj(mixed)
 
 
-class FakeMLP(nn.Module):
-    def __init__(self, hidden: int = 8, width: int = 12):
-        super().__init__()
-        self.gate_proj = nn.Linear(hidden, width, bias=False)
-        self.up_proj = nn.Linear(hidden, width, bias=False)
-        self.down_proj = nn.Linear(width, hidden, bias=False)
-
-    def forward(self, x):
-        return self.down_proj(torch.sigmoid(self.gate_proj(x)) * self.up_proj(x))
-
-
-class FakeLayer(nn.Module):
+class ToyLayer(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.self_attn = FakeAttention()
-        self.mlp = FakeMLP()
+        self.self_attn = ToyAttention()
+        self.mlp = ToyMLP()
 
     def forward(self, x):
-        return x + self.self_attn(x) + self.mlp(x)
+        x = x + self.self_attn(x)
+        gate = torch.sigmoid(self.mlp.gate_proj(x))
+        up = self.mlp.up_proj(x)
+        return x + self.mlp.down_proj(gate * up)
 
 
-class FakeLM(nn.Module):
-    def __init__(self, layers: int = 2, vocab: int = 17):
+class ToyModel(torch.nn.Module):
+    def __init__(self):
         super().__init__()
-        self.embed = nn.Embedding(vocab, 8)
-        self.model = nn.Module()
-        self.model.layers = nn.ModuleList([FakeLayer() for _ in range(layers)])
-        self.lm_head = nn.Linear(8, vocab, bias=False)
+        self.model = SimpleNamespace(layers=[ToyLayer(), ToyLayer()])
+
+
+def test_structured_mlp_and_attention_zeroing():
+    model = ToyModel()
+    zero_structured_units_(
+        model,
+        {
+            "mlp": {0: [1, 4], 1: [2]},
+            "attention": {0: [1], 1: [0]},
+        },
+    )
+    layer0 = model.model.layers[0]
+    assert torch.count_nonzero(layer0.mlp.gate_proj.weight[[1, 4]]) == 0
+    assert torch.count_nonzero(layer0.mlp.up_proj.weight[[1, 4]]) == 0
+    assert torch.count_nonzero(layer0.mlp.down_proj.weight[:, [1, 4]]) == 0
+    assert torch.count_nonzero(layer0.mlp.gate_proj.bias[[1, 4]]) == 0
+
+    # Head 1 corresponds to rows/columns 2:4 for hidden=4, heads=2.
+    assert torch.count_nonzero(layer0.self_attn.q_proj.weight[2:4]) == 0
+    assert torch.count_nonzero(layer0.self_attn.k_proj.weight[2:4]) == 0
+    assert torch.count_nonzero(layer0.self_attn.v_proj.weight[2:4]) == 0
+    assert torch.count_nonzero(layer0.self_attn.o_proj.weight[:, 2:4]) == 0
+
+
+class TinyBackbone(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = torch.nn.ModuleList([ToyLayer(), ToyLayer()])
+
+
+class TinyCausalLM(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embed = torch.nn.Embedding(13, 4)
+        self.model = TinyBackbone()
+        self.lm_head = torch.nn.Linear(4, 13, bias=False)
         self.config = SimpleNamespace(
-            use_cache=False,
-            hidden_size=8,
-            intermediate_size=12,
-            num_hidden_layers=layers,
+            use_cache=True,
+            _name_or_path="tiny",
             num_attention_heads=2,
             num_key_value_heads=2,
-            vocab_size=vocab,
-            model_type="fake",
-            _name_or_path="fake",
         )
 
     def get_input_embeddings(self):
@@ -282,177 +183,313 @@ class FakeLM(nn.Module):
         for layer in self.model.layers:
             x = layer(x)
         logits = self.lm_head(x)
-        loss = nn.functional.cross_entropy(
-            logits[:, :-1, :].reshape(-1, logits.shape[-1]),
-            input_ids[:, 1:].reshape(-1),
-        )
-        return SimpleNamespace(logits=logits, loss=loss)
+        shift_logits = logits[:, :-1].reshape(-1, logits.size(-1))
+        shift_labels = input_ids[:, 1:].reshape(-1)
+        loss = torch.nn.functional.cross_entropy(shift_logits, shift_labels)
+        return SimpleNamespace(loss=loss, logits=logits)
 
 
-def test_gradient_collector_captures_complete_structural_units(tmp_path):
-    torch.manual_seed(0)
-    model = FakeLM(layers=2)
-    loader = [(torch.randint(0, 17, (1, 24)), None) for _ in range(4)]
+def test_gradient_response_collector_mlp_and_attention(tmp_path):
+    model = TinyCausalLM()
+    dataloader = []
+    for offset in range(4):
+        ids = (torch.arange(12).unsqueeze(0) + offset) % 13
+        dataloader.append((ids, ids.clone()))
     cache = collect_gradient_response_cache(
         model,
-        loader,
+        dataloader,
         tmp_path / "cache",
-        scenario_ratios="1.0",
-        scenario_crops="prefix",
-        fine_bins=4,
+        scenario_ratios="0.75,1.0",
+        response_length=8,
         event_bins=2,
-        overwrite=True,
-        cache_signature={"test": 1},
     )
-    assert cache.load_layer(0, "mlp").shape == (4, 12, 4)
-    assert cache.load_layer(0, "attention").shape == (4, 2, 4)
-    assert cache.position_offsets.shape == (5,)
-    assert cache.position_loss_slice(0).shape == (23,)
-    assert cache.position_event_slice(0).shape == (23,)
+    assert cache.num_observations == 8
+    assert cache.load_layer(0, "mlp").shape == (8, 6, 8)
+    assert cache.load_layer(0, "attention").shape == (8, 2, 8)
+    assert cache.unit_counts["mlp"][0] == 6
+    assert cache.unit_counts["attention"][0] == 2
     assert np.unique(cache.events).size == 2
+    assert np.isfinite(cache.losses).all()
+    for module_name in ALL_LINEAR_MODULES:
+        scale = cache.load_activation_scale(0, module_name)
+        assert scale.shape == (getattr(getattr(model.model.layers[0], module_name.split('.')[0]), module_name.split('.')[1]).in_features,)
+        assert np.isfinite(scale).all()
+        assert np.all(scale >= 0)
 
 
-def test_complete_unit_zeroing_changes_all_coupled_tensors():
-    model = FakeLM(layers=1)
-    layer = model.model.layers[0]
-    zero_mlp_channels_(model, {0: [2]})
-    assert torch.count_nonzero(layer.mlp.gate_proj.weight[2]) == 0
-    assert torch.count_nonzero(layer.mlp.up_proj.weight[2]) == 0
-    assert torch.count_nonzero(layer.mlp.down_proj.weight[:, 2]) == 0
+class FakeResponseCache:
+    def __init__(self, model):
+        self.attention_layouts = {
+            layer_id: {"num_heads": 2, "num_key_value_heads": 2, "head_dim": 2}
+            for layer_id, _ in enumerate(model.model.layers)
+        }
+        self.scales = {}
+        for layer_id, layer in enumerate(model.model.layers):
+            for module_name in ALL_LINEAR_MODULES:
+                module = layer
+                for part in module_name.split("."):
+                    module = getattr(module, part)
+                self.scales[(layer_id, module_name)] = np.linspace(0.5, 1.5, module.in_features).astype(np.float32)
 
-    zero_attention_heads_(model, {0: [1]})
-    rows = slice(4, 8)
-    assert torch.count_nonzero(layer.self_attn.q_proj.weight[rows]) == 0
-    assert torch.count_nonzero(layer.self_attn.k_proj.weight[rows]) == 0
-    assert torch.count_nonzero(layer.self_attn.v_proj.weight[rows]) == 0
-    assert torch.count_nonzero(layer.self_attn.o_proj.weight[:, rows]) == 0
+    def load_activation_scale(self, layer_id, module_name):
+        return self.scales[(layer_id, module_name)]
 
 
-def test_physical_surgery_reduces_unit_dimensions():
-    model = FakeLM(layers=1)
-    before = sum(parameter.numel() for parameter in model.parameters())
-    summary = materialize_structured_units_(
+def _toy_scores(model, reverse=False):
+    result = {"mlp": {}, "attention": {}}
+    for layer_id, layer in enumerate(model.model.layers):
+        mlp = np.arange(layer.mlp.down_proj.in_features, dtype=np.float32)
+        attn = np.arange(layer.self_attn.num_heads, dtype=np.float32)
+        if reverse:
+            mlp = mlp[::-1].copy()
+            attn = attn[::-1].copy()
+        result["mlp"][layer_id] = mlp
+        result["attention"][layer_id] = attn
+    return result
+
+
+def test_row_budget_is_exact_and_score_aware():
+    scores = np.arange(6, dtype=np.float32)
+    counts = allocate_row_prune_counts(
+        scores, rows_per_unit=1, columns=10, target_ratio=0.5, spread=0.8, temperature=2.0
+    )
+    assert counts.sum() == 30
+    assert counts[0] > counts[-1]
+
+
+def test_wanda_weight_masks_cover_attention_and_mlp():
+    torch.manual_seed(1)
+    model = ToyModel()
+    cache = FakeResponseCache(model)
+    summaries = apply_paper_wanda_weight_masks_(
         model,
-        {"mlp": {0: [0, 1]}, "attention": {0: [1]}},
-        require_uniform=True,
+        _toy_scores(model),
+        cache,
+        targets=("mlp", "attention"),
+        mlp_ratio=0.5,
+        attention_ratio=0.5,
+        chunk_rows=2,
     )
-    layer = model.model.layers[0]
-    assert layer.mlp.down_proj.in_features == 10
-    assert layer.self_attn.num_heads == 1
-    assert layer.self_attn.q_proj.out_features == 4
-    assert summary["parameters_after"] < before
+    assert len(summaries) == 2 * 7
+    for layer in model.model.layers:
+        for module_name in ALL_LINEAR_MODULES:
+            module = layer
+            for part in module_name.split("."):
+                module = getattr(module, part)
+            ratio = float((module.weight == 0).sum().item()) / module.weight.numel()
+            assert abs(ratio - 0.5) <= 1.0 / module.weight.numel()
 
 
-class FakeTokenizer:
-    def __call__(self, text, return_tensors, truncation, max_length, add_special_tokens):
-        del return_tensors, truncation, add_special_tokens
-        ids = [min(30, ord(char) % 31) for char in text][:max_length]
-        return SimpleNamespace(input_ids=torch.tensor([ids], dtype=torch.long))
-
-
-def test_scenario_manifest_preserves_paired_sample_and_scenario_ids(tmp_path):
-    path = tmp_path / "scenarios.jsonl"
-    records = [
-        {"text": "abcdefghijk", "base_sample_id": "a", "scenario_id": "short", "task": "x"},
-        {"text": "abcdefghijkl", "base_sample_id": "a", "scenario_id": "long", "task": "x"},
-    ]
-    path.write_text("\n".join(json.dumps(item) for item in records), encoding="utf-8")
-    loaded = load_scenario_manifest(path, FakeTokenizer(), max_length=16)
-    assert len(loaded) == 2
-    assert loaded[0]["base_sample_id"] == loaded[1]["base_sample_id"]
-    assert {item["scenario_id"] for item in loaded} == {"short", "long"}
-
-
-def test_source_tree_contains_no_removed_legacy_component_name():
-    root = Path(__file__).resolve().parents[1]
-    prohibited = "wan" + "da"
-    hits = []
-    for path in root.rglob("*"):
-        if path.is_file() and path.suffix.lower() in {".py", ".md", ".sh", ".txt"}:
-            if prohibited in path.read_text(encoding="utf-8", errors="ignore").lower():
-                hits.append(str(path.relative_to(root)))
-    assert hits == []
-
-
-def _strict_ablation_config():
-    return PipelineConfig(
-        frequency=FrequencyConfig(
-            fine_bins=8,
-            target_bands=3,
-            mi_neighbors=2,
-            probe_units=3,
-        ),
-        granular_ball=GranularBallConfig(
-            purity_thresholds=(0.60, 0.75),
-            granularity_weight_mode="equal",
-            min_ball_size=4,
-            max_balls=8,
-            max_depth=3,
-            workers=1,
-            kde_scope="none",
-        ),
-        lcb=LCBConfig(
-            repeats=3,
-            sample_fraction=0.8,
-            scenario_fraction=0.75,
-            lcb_lambda=1.0,
-            workers=1,
-        ),
-        budget=BudgetConfig(coverage_ratio=0.8, coverage_alpha=0.2),
+def test_paper_scores_change_wanda_weight_masks():
+    torch.manual_seed(7)
+    left = ToyModel()
+    torch.manual_seed(7)
+    right = ToyModel()
+    apply_paper_wanda_weight_masks_(
+        left, _toy_scores(left), FakeResponseCache(left), ("mlp", "attention"), 0.5, 0.5, chunk_rows=2
     )
+    apply_paper_wanda_weight_masks_(
+        right, _toy_scores(right, reverse=True), FakeResponseCache(right), ("mlp", "attention"), 0.5, 0.5, chunk_rows=2
+    )
+    differences = 0
+    for left_layer, right_layer in zip(left.model.layers, right.model.layers):
+        for module_name in ALL_LINEAR_MODULES:
+            a, b = left_layer, right_layer
+            for part in module_name.split("."):
+                a, b = getattr(a, part), getattr(b, part)
+            differences += int(torch.count_nonzero((a.weight == 0) != (b.weight == 0)).item())
+    assert differences > 0
 
 
-def test_strict_mi_stage_does_not_execute_granular_ball_or_lcb():
-    responses, events, scenarios, base_ids = _synthetic_responses(seed=31)
-    result = score_layer(
-        responses,
+def test_dual_source_bootstrap_preserves_valid_event_support():
+    from lib.paper_pruning.resampling import dual_source_bootstrap_indices
+
+    base = np.repeat(np.arange(12), 3)
+    scenario = np.tile(np.arange(3), 12)
+    events = (base % 3).astype(np.int64)
+    indices = dual_source_bootstrap_indices(
+        events,
+        base,
+        scenario,
+        sample_fraction=0.75,
+        scenario_fraction=2 / 3,
+        rng=np.random.default_rng(42),
+    )
+    assert indices.ndim == 1
+    assert indices.size >= 2
+    classes, counts = np.unique(events[indices], return_counts=True)
+    assert classes.size >= 2
+    assert counts.min() >= 2
+
+
+def test_coverage_aware_budget_is_exact():
+    from lib.paper_pruning.budget import coverage_aware_keep_indices
+    from lib.paper_pruning.config import BudgetConfig
+
+    scores = np.linspace(0.0, 1.0, 20)
+    bands = np.zeros((20, 3), dtype=np.float64)
+    bands[:7, 0] = 1.0
+    bands[7:14, 1] = 1.0
+    bands[14:, 2] = 1.0
+    keep, priority, achieved = coverage_aware_keep_indices(
+        scores,
+        bands,
+        keep_count=10,
+        cfg=BudgetConfig(coverage_ratio=0.5, coverage_alpha=1.0, greedy_batches=10),
+    )
+    assert keep.size == 10
+    assert priority.shape == (20,)
+    assert achieved.shape == (3,)
+    assert np.isfinite(priority).all()
+    assert np.all(achieved > 0)
+
+
+def test_gentle_guidance_stays_close_to_wanda():
+    from lib.paper_pruning.wanda_weight import centered_rank_factor
+
+    factors = centered_rank_factor(np.arange(100), strength=0.01)
+    assert factors.min() > 0.989
+    assert factors.max() < 1.011
+    assert np.isclose(np.median(factors), 1.0, atol=2e-3)
+
+
+def test_zero_guidance_and_zero_spread_matches_fixed_row_wanda():
+    from lib.paper_pruning.wanda_weight import apply_guided_wanda_module_
+
+    torch.manual_seed(11)
+    module = torch.nn.Linear(12, 8, bias=False)
+    scaler = torch.linspace(0.5, 1.5, 12)
+    original = module.weight.detach().clone()
+    metric = original.abs().float() * torch.sqrt(scaler.float()).unsqueeze(0)
+    expected = torch.zeros_like(metric, dtype=torch.bool)
+    expected.scatter_(1, torch.topk(metric, 6, dim=1, largest=False).indices, True)
+
+    apply_guided_wanda_module_(
+        "mlp.gate_proj",
+        module,
+        scaler,
+        unit_scores=np.arange(8, dtype=np.float32),
+        ratio=0.5,
+        head_dim=1,
+        row_spread=0.0,
+        guidance_strength=0.0,
+        chunk_rows=3,
+    )
+    assert torch.equal(module.weight == 0, expected)
+
+
+def test_fast_small_mi_matches_numpy_path():
+    rng = np.random.default_rng(81)
+    values = rng.normal(size=(48, 4))
+    events = np.tile(np.arange(3), 16)
+    fast = estimate_knn_mi_matrix(
+        values, events, FrequencyConfig(mi_neighbors=3, fast_small_mi=True)
+    )
+    slow = estimate_knn_mi_matrix(
+        values, events, FrequencyConfig(mi_neighbors=3, fast_small_mi=False)
+    )
+    assert np.allclose(fast, slow, rtol=1e-11, atol=1e-12)
+
+
+def test_probe_kde_scope_does_not_change_primary_granular_scores():
+    x, events, _ = synthetic_responses(9)
+    spectrum = build_frequency_spectrum(
+        x, events, FrequencyConfig(fine_bins=8, target_bands=4, probe_units=6)
+    )
+    common = dict(
+        purity_thresholds=(0.55, 0.65),
+        min_ball_size=6,
+        max_balls=12,
+        max_depth=3,
+        min_event_classes=1,
+        localization_mode="unit_local",
+        workers=1,
+        worker_chunk_size=8,
+    )
+    all_knn, all_kde, _ = multi_granularity_local_mi(
+        spectrum.band_energy,
+        events,
+        FrequencyConfig(fine_bins=8, target_bands=4, probe_units=6),
+        GranularBallConfig(**common, kde_scope="all"),
+        compute_kde=True,
+        kde_unit_indices=None,
+    )
+    probe_knn, probe_kde, _ = multi_granularity_local_mi(
+        spectrum.band_energy,
+        events,
+        FrequencyConfig(fine_bins=8, target_bands=4, probe_units=6),
+        GranularBallConfig(**common, kde_scope="probe"),
+        compute_kde=True,
+        kde_unit_indices=spectrum.probe_indices,
+    )
+    assert np.allclose(all_knn, probe_knn, rtol=1e-12, atol=1e-12)
+    assert np.isfinite(probe_kde[spectrum.probe_indices]).all()
+    missing = np.setdiff1d(np.arange(probe_kde.shape[0]), spectrum.probe_indices)
+    assert np.isnan(probe_kde[missing]).all()
+    assert np.isfinite(all_kde).all()
+
+
+def test_parallel_lcb_repeats_are_deterministic():
+    x, events, scenarios = synthetic_responses(11)
+    gb = GranularBallConfig(
+        purity_thresholds=(0.55, 0.65),
+        min_ball_size=6,
+        max_balls=12,
+        max_depth=3,
+        min_event_classes=1,
+        localization_mode="unit_local",
+        workers=4,
+        worker_chunk_size=8,
+        kde_scope="probe",
+    )
+    base = dict(
+        frequency=FrequencyConfig(fine_bins=8, target_bands=4, mi_neighbors=2),
+        granular_ball=gb,
+    )
+    serial = score_layer(
+        x,
         events,
         scenarios,
-        _strict_ablation_config(),
-        base_sample_ids=base_ids,
-        method="paper_mi",
+        PipelineConfig(
+            **base,
+            lcb=LCBConfig(
+                repeats=3, sample_fraction=0.75, random_state=19, workers=1
+            ),
+        ),
+        layer_id=2,
     )
-    assert result.executed_stages == ("mutual_information",)
-    assert result.bootstrap_scores.shape[0] == 0
-    assert np.isnan(result.granular_score).all()
-    assert np.isnan(result.lcb_score).all()
-    assert np.array_equal(result.selected_score, result.mi_score)
-
-
-def test_strict_mi_gb_stage_does_not_execute_repeats_or_lcb():
-    responses, events, scenarios, base_ids = _synthetic_responses(seed=32)
-    result = score_layer(
-        responses,
+    parallel = score_layer(
+        x,
         events,
         scenarios,
-        _strict_ablation_config(),
-        base_sample_ids=base_ids,
-        method="paper_mi_gb",
+        PipelineConfig(
+            **base,
+            lcb=LCBConfig(
+                repeats=3, sample_fraction=0.75, random_state=19, workers=3
+            ),
+        ),
+        layer_id=2,
     )
-    assert result.executed_stages == (
-        "mutual_information",
-        "granular_ball",
-        "multi_granularity_fusion",
-    )
-    assert result.bootstrap_scores.shape[0] == 0
-    assert np.isnan(result.lcb_score).all()
-    assert np.allclose(result.granularity_weights, [0.5, 0.5])
-    assert np.array_equal(result.selected_score, result.granular_score)
+    assert np.array_equal(serial.bootstrap_scores, parallel.bootstrap_scores)
+    assert np.array_equal(serial.lcb_score, parallel.lcb_score)
 
 
-def test_strict_full_stage_adds_repeated_estimation_and_lcb_only():
-    responses, events, scenarios, base_ids = _synthetic_responses(seed=33)
-    result = score_layer(
-        responses,
-        events,
-        scenarios,
-        _strict_ablation_config(),
-        base_sample_ids=base_ids,
-        method="paper_mi_gb_lcb",
+def test_mi50_profile_keeps_every_matrix_exactly_half_sparse():
+    torch.manual_seed(23)
+    model = ToyModel()
+    summaries = apply_paper_wanda_weight_masks_(
+        model,
+        _toy_scores(model),
+        FakeResponseCache(model),
+        targets=("mlp", "attention"),
+        mlp_ratio=0.5,
+        attention_ratio=0.5,
+        row_spread=0.0,
+        guidance_strength=0.001,
+        chunk_rows=2,
     )
-    assert "dual_source_repeated_estimation" in result.executed_stages
-    assert "lcb" in result.executed_stages
-    assert result.bootstrap_scores.shape[0] == 3
-    assert np.allclose(result.granularity_weights, [0.5, 0.5])
-    assert np.allclose(result.lcb_score, result.lcb_mean - result.lcb_std)
-    assert np.array_equal(result.selected_score, result.lcb_score)
+    assert summaries
+    for summary in summaries:
+        assert summary["zeros_before"] == 0
+        assert summary["zeros_after"] * 2 == summary["rows"] * summary["columns"]
+        assert summary["actual_ratio"] == 0.5
