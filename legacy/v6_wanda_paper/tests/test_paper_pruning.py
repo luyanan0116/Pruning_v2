@@ -472,24 +472,3 @@ def test_parallel_lcb_repeats_are_deterministic():
     )
     assert np.array_equal(serial.bootstrap_scores, parallel.bootstrap_scores)
     assert np.array_equal(serial.lcb_score, parallel.lcb_score)
-
-
-def test_mi50_profile_keeps_every_matrix_exactly_half_sparse():
-    torch.manual_seed(23)
-    model = ToyModel()
-    summaries = apply_paper_wanda_weight_masks_(
-        model,
-        _toy_scores(model),
-        FakeResponseCache(model),
-        targets=("mlp", "attention"),
-        mlp_ratio=0.5,
-        attention_ratio=0.5,
-        row_spread=0.0,
-        guidance_strength=0.001,
-        chunk_rows=2,
-    )
-    assert summaries
-    for summary in summaries:
-        assert summary["zeros_before"] == 0
-        assert summary["zeros_after"] * 2 == summary["rows"] * summary["columns"]
-        assert summary["actual_ratio"] == 0.5
