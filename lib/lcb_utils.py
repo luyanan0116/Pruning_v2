@@ -53,7 +53,7 @@ def step1_frequency_domain_mi(responses_list, device, num_bins=10, chunk_size=8)
 # ==========================================================
 def step2_granular_ball_estimation(z_q, args):
     num_bins, batch_size, in_features = z_q.shape
-    R = getattr(args, 'n_samples_lcb', 10)
+    R = 1
     
     mi_estimates = []
     for r in range(R):
@@ -91,7 +91,7 @@ def compute_lcb_weight_metric(weight, real_responses_list, scaler_row, args):
     
     # [Step 3] 计算置信下界
     S_mean = S_estimates.mean(dim=0)
-    S_std = S_estimates.std(dim=0)
+    S_std = torch.zeros_like(S_mean)
     
     lam = getattr(args, 'lcb_lambda', 1.0)
     lcb_score_in = S_mean - lam * S_std  

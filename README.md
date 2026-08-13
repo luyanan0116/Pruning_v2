@@ -14,8 +14,7 @@ Important fast-path controls:
 --paper_fast_small_mi       exact Numba JIT for small ball-level kNN MI
 --paper_kde_scope probe     KDE only on representative units; does not affect masks/PPL
 --paper_gb_workers 16-32    total unit-local CPU worker budget
---paper_gb_chunk_size 64    amortizes thread scheduling overhead
---paper_lcb_workers 2-4     deterministic parallel LCB repeats
+--paper_gb_chunk_size 64    amortizes thread scheduling overhead single-pass LCB-compatible scoring (no repeats)
 ```
 
 # Pruning Paper-Aligned v5
@@ -87,3 +86,17 @@ results/.../shared_score_report/weight_mask_summary_*.csv
 ## 真实性说明
 
 本代码包在本地完成了静态检查和单元测试，但没有用户服务器上的 Llama-2-7B、C4、WikiText-2 和 A100，因此没有宣称已经复现 PPL=6.5。请先运行普通 Wanda 基线，再运行论文引导消融。
+
+## Single-pass change
+
+This build removes the repeated LCB/bootstrap computation. MI and granular-ball
+localization are computed once on the available calibration/scenario observations.
+
+Consequences:
+
+- no 20/10/N-times repeated scoring loop;
+- `lcb_std = 0`;
+- `LCB = one-pass granular-ball contribution score`;
+- frequency-band coverage and `paper_hybrid` configuration selection remain active.
+
+This is faster, but it no longer estimates uncertainty from repeated samples.

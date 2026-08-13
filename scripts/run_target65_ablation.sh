@@ -20,9 +20,7 @@ PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" python -u r
   --paper_purity_thresholds 0.65,0.75,0.85 \
   --paper_min_ball_size 8 --paper_max_balls 64 --paper_max_ball_depth 5 \
   --paper_gb_localization unit_local --paper_gb_workers 8 \
-  --paper_min_event_classes 2 --paper_compactness_ratio 0.55 \
-  --paper_sample_fraction 0.8 --paper_scenario_fraction 1.0 \
-  --n_samples_lcb 10 --lcb_lambda 1.0 \
+  --paper_min_event_classes 2 --paper_compactness_ratio 0.55 \  --lcb_lambda 1.0 \
   --paper_band_coverage_ratio 0.90 --paper_coverage_alpha 0.25 \
   --paper_greedy_batches 64 \
   --paper_wanda_sequential --paper_wanda_nsamples 128 \

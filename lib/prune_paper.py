@@ -22,7 +22,7 @@ from .paper_pruning.config import (
     LCBConfig,
     PipelineConfig,
 )
-from .paper_pruning.budget import coverage_aware_keep_indices
+from .paper_pruning.budget import select_keep_indices
 from .paper_pruning.pipeline import score_layer
 from .paper_pruning.reporting import (
     LayerReportWriter,
@@ -120,17 +120,25 @@ def _pipeline_config(args) -> PipelineConfig:
             random_state=args.seed,
         ),
         lcb=LCBConfig(
-            repeats=args.n_samples_lcb,
-            sample_fraction=args.paper_sample_fraction,
-            scenario_fraction=args.paper_scenario_fraction,
+            repeats=1,
+            sample_fraction=1.0,
+            scenario_fraction=1.0,
             lcb_lambda=args.lcb_lambda,
-            stratify_by_scenario=True,
-            cluster_by_base_sample=True,
+            stratify_by_scenario=False,
+            cluster_by_base_sample=False,
             random_state=args.seed,
-            workers=args.paper_lcb_workers,
+            workers=1,
         ),
         budget=BudgetConfig(
             coverage_ratio=args.paper_band_coverage_ratio,
+            coverage_ratios=(
+                None if args.paper_band_coverage_ratios is None
+                else _parse_float_tuple(args.paper_band_coverage_ratios)
+            ),
+            band_selection_weights=(
+                None if args.paper_band_selection_weights is None
+                else _parse_float_tuple(args.paper_band_selection_weights)
+            ),
             coverage_alpha=args.paper_coverage_alpha,
             greedy_batches=args.paper_greedy_batches,
         ),
@@ -163,16 +171,7 @@ def _config_payload(args, config: PipelineConfig, cache, targets: tuple[str, ...
             for unit_type in targets
         },
         "prune_step": int(args.paper_prune_step),
-        "mask_style": args.paper_mask_style,
-        "wanda_weight": {
-            "sequential": bool(args.paper_wanda_sequential),
-            "calibration_nsamples": int(args.paper_wanda_nsamples),
-            "calibration_seqlen": int(args.paper_wanda_seqlen),
-            "guidance_strength": float(args.paper_wanda_guidance_strength),
-            "row_spread": float(args.paper_wanda_row_spread),
-            "temperature": float(args.paper_wanda_temperature),
-            "chunk_rows": int(args.paper_wanda_chunk_rows),
-        },
+        "final_keep_strategy": args.paper_final_keep_strategy,
         "response_cache": str(cache.root.resolve()),
         "num_observations": cache.num_observations,
         "response_length": cache.response_length,
@@ -257,6 +256,18 @@ def _score_or_load(
         for method in METHODS
     }
 
+    coverage_targets = (
+        config.budget.coverage_ratios
+        if config.budget.coverage_ratios is not None
+        else tuple([config.budget.coverage_ratio] * config.frequency.target_bands)
+    )
+    print(
+        f"[paper selection] strategy={args.paper_final_keep_strategy}, "
+        f"bands={config.frequency.target_bands}, coverage_targets={coverage_targets}, "
+        f"band_selection_weights={config.budget.band_selection_weights}",
+        flush=True,
+    )
+
     try:
         for layer_id in range(cache.num_layers):
             print(f"[paper scoring] layer {layer_id + 1}/{cache.num_layers}")
@@ -285,15 +296,15 @@ def _score_or_load(
                     "paper_mi": np.asarray(scores.global_spectrum.band_mi, dtype=np.float64),
                     "paper_mi_gb": np.asarray(scores.granular_band_mi, dtype=np.float64),
                     "paper_mi_gb_lcb": np.asarray(
-                        scores.lcb_band_mean - config.lcb.lcb_lambda * scores.lcb_band_std,
-                        dtype=np.float64,
+                        scores.lcb_band_mean, dtype=np.float64
                     ),
                 }
                 keep_count = scores.mi_score.size - prune_count
                 layer_selections = {}
                 coverage_text = []
                 for method in METHODS:
-                    keep, priority, achieved = coverage_aware_keep_indices(
+                    keep, priority, achieved = select_keep_indices(
+                        args.paper_final_keep_strategy,
                         layer_score_vectors[method],
                         layer_band_vectors[method],
                         keep_count,

@@ -5,7 +5,6 @@ cd "$(dirname "$0")/.."
 
 NCPU=$(nproc)
 GB_WORKERS=${GB_WORKERS:-$(( NCPU < 32 ? NCPU : 32 ))}
-LCB_WORKERS=${LCB_WORKERS:-4}
 
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
@@ -50,16 +49,10 @@ python -u run_paper_ablation.py \
   --paper_max_ball_depth 5 \
   --paper_gb_localization unit_local \
   --paper_gb_workers "$GB_WORKERS" \
-  --paper_gb_chunk_size 64 \
-  --paper_lcb_workers "$LCB_WORKERS" \
-  --paper_min_event_classes 2 \
+  --paper_gb_chunk_size 64 \   --paper_min_event_classes 2 \
   --paper_min_purity_gain 0.0 \
   --paper_min_radius_reduction 0.0 \
-  --paper_compactness_ratio 0.55 \
-  --paper_sample_fraction 0.8 \
-  --paper_scenario_fraction 1.0 \
-  --n_samples_lcb 10 \
-  --lcb_lambda 1.0 \
+  --paper_compactness_ratio 0.55 \    --lcb_lambda 1.0 \
   --paper_band_coverage_ratio 0.90 \
   --paper_coverage_alpha 0.25 \
   --paper_greedy_batches 64 \

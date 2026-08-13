@@ -48,7 +48,6 @@ def main():
 
     # Paper-aligned ablation: Eq. (1)-(10) in the uploaded proposal.
     parser.add_argument("--lcb_lambda", type=float, default=1.0, help="LCB risk coefficient lambda")
-    parser.add_argument("--n_samples_lcb", type=int, default=10, help="number of repeated LCB estimates")
     parser.add_argument("--prune_per_layer", type=int, default=0,
                         help="exact MLP channels removed per layer; 0 uses mlp_sparsity_ratio/sparsity_ratio")
     parser.add_argument("--attention_prune_per_layer", type=int, default=0,
@@ -62,11 +61,11 @@ def main():
     parser.add_argument(
         "--paper_mask_style",
         type=str,
-        default="wanda_weight",
+        default="structured_unit",
         choices=["wanda_weight", "structured_unit"],
         help=(
-            "wanda_weight applies Wanda-style unstructured masks to all q/k/v/o and "
-            "gate/up/down matrices; structured_unit removes complete MLP channels/heads"
+            "structured_unit is the paper-aligned default and removes complete MLP channels/heads; "
+            "wanda_weight is retained only as the legacy 50%-weight comparison baseline"
         ),
     )
     parser.add_argument("--paper_wanda_score_floor", type=float, default=0.05,
@@ -121,15 +120,26 @@ def main():
     parser.add_argument("--paper_kde_scope", type=str, default="probe",
                         choices=["all", "probe", "none"],
                         help="auxiliary KDE diagnostics: all units, probe units only, or disabled; never changes kNN pruning scores")
-    parser.add_argument("--paper_lcb_workers", type=int, default=4,
-                        help="parallel LCB repeats; total nested workers remain bounded by paper_gb_workers")
     parser.add_argument("--paper_min_purity_gain", type=float, default=0.0)
     parser.add_argument("--paper_min_radius_reduction", type=float, default=0.0)
     parser.add_argument("--paper_compactness_ratio", type=float, default=0.55)
     parser.add_argument("--paper_min_event_classes", type=int, default=2)
-    parser.add_argument("--paper_sample_fraction", type=float, default=0.8)
-    parser.add_argument("--paper_scenario_fraction", type=float, default=1.0)
-    parser.add_argument("--paper_band_coverage_ratio", type=float, default=0.90)
+    parser.add_argument("--paper_band_coverage_ratio", type=float, default=0.90,
+                        help="uniform fallback gamma when per-band ratios are not supplied")
+    parser.add_argument("--paper_band_coverage_ratios", type=str, default=None,
+                        help="per-band gamma_b targets, e.g. 0.85,0.70,0.55 for low/mid/high")
+    parser.add_argument("--paper_band_selection_weights", type=str, default=None,
+                        help="band-only ranking weights, e.g. 1.0,0.7,0.4 for low/mid/high")
+    parser.add_argument(
+        "--paper_final_keep_strategy",
+        type=str,
+        default="paper_hybrid",
+        choices=["paper_hybrid", "lcb_only", "band_only"],
+        help=(
+            "paper_hybrid uses scalar score/LCB plus frequency under-coverage; "
+            "lcb_only keeps by scalar LCB; band_only keeps by frequency contribution only"
+        ),
+    )
     parser.add_argument("--paper_coverage_alpha", type=float, default=0.25)
     parser.add_argument("--paper_greedy_batches", type=int, default=64)
     parser.add_argument("--paper_cache_dir", type=str, default="paper_response_cache")
@@ -163,6 +173,24 @@ def main():
             parser.error("--paper_prune_targets must contain mlp and/or attention")
         mlp_ratio = args.sparsity_ratio if args.mlp_sparsity_ratio is None else args.mlp_sparsity_ratio
         attn_ratio = args.sparsity_ratio if args.attention_sparsity_ratio is None else args.attention_sparsity_ratio
+        if args.paper_band_coverage_ratios is not None:
+            try:
+                coverage_values = [float(v.strip()) for v in args.paper_band_coverage_ratios.split(",") if v.strip()]
+            except ValueError as exc:
+                parser.error(f"invalid --paper_band_coverage_ratios: {exc}")
+            if len(coverage_values) != args.paper_num_bands:
+                parser.error("--paper_band_coverage_ratios length must equal --paper_num_bands")
+            if any(not 0 < value <= 1 for value in coverage_values):
+                parser.error("each --paper_band_coverage_ratios value must be in (0,1]")
+        if args.paper_band_selection_weights is not None:
+            try:
+                band_weights = [float(v.strip()) for v in args.paper_band_selection_weights.split(",") if v.strip()]
+            except ValueError as exc:
+                parser.error(f"invalid --paper_band_selection_weights: {exc}")
+            if len(band_weights) != args.paper_num_bands:
+                parser.error("--paper_band_selection_weights length must equal --paper_num_bands")
+            if any(value < 0 for value in band_weights) or not any(value > 0 for value in band_weights):
+                parser.error("band selection weights must be non-negative and not all zero")
         if args.paper_mask_style == "wanda_weight":
             if args.prune_per_layer > 0 or args.attention_prune_per_layer > 0:
                 parser.error(

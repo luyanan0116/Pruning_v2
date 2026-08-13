@@ -30,12 +30,12 @@ its primary kNN MI, granular-ball, bootstrap, LCB or budget-selection formulas.
    - Each thread handles a block of units instead of scheduling 11,008 tiny
      futures. Results are written back by original unit index.
 
-6. **Parallel LCB repeats with deterministic sampling**
+6. **Single-pass LCB-compatible scoring**
    - All bootstrap indices are generated serially from the original random seed
      before parallel execution. Therefore the same repeated samples are used.
    - Total nested concurrency remains bounded by `paper_gb_workers`.
 
-7. **No diagnostic hierarchy inside LCB repeats**
+7. **No repeated LCB estimation**
    - Diagnostic balls are only needed for figures and CSV summaries. v6 still
      rebuilds every scoring ball in every repeat, but does not build an extra
      unused layer-level diagnostic hierarchy.

@@ -100,7 +100,7 @@ class GranularBallConfig:
 class LCBConfig:
     """Paper equations (9)-(10) / detailed equations (25)-(27)."""
 
-    repeats: int = 20
+    repeats: int = 1
     sample_fraction: float = 0.8
     scenario_fraction: float = 1.0
     lcb_lambda: float = 1.0
@@ -110,8 +110,8 @@ class LCBConfig:
     workers: int = 1
 
     def validate(self) -> None:
-        if self.repeats < 2:
-            raise ValueError("repeats must be >= 2")
+        if self.repeats != 1:
+            raise ValueError("single-pass build requires repeats == 1")
         if not 0 < self.sample_fraction <= 1:
             raise ValueError("sample_fraction must be in (0, 1]")
         if not 0 < self.scenario_fraction <= 1:
@@ -127,12 +127,26 @@ class BudgetConfig:
     """Paper equations (11)-(13): coverage-aware budget configuration."""
 
     coverage_ratio: float = 0.90
+    coverage_ratios: Optional[Tuple[float, ...]] = None
+    band_selection_weights: Optional[Tuple[float, ...]] = None
     coverage_alpha: float = 0.25
     greedy_batches: int = 64
 
     def validate(self) -> None:
         if not 0 < self.coverage_ratio <= 1:
             raise ValueError("coverage_ratio must be in (0,1]")
+        if self.coverage_ratios is not None:
+            if not self.coverage_ratios:
+                raise ValueError("coverage_ratios cannot be empty")
+            if any(not 0 < value <= 1 for value in self.coverage_ratios):
+                raise ValueError("every coverage ratio must be in (0,1]")
+        if self.band_selection_weights is not None:
+            if not self.band_selection_weights:
+                raise ValueError("band_selection_weights cannot be empty")
+            if any(value < 0 for value in self.band_selection_weights):
+                raise ValueError("band_selection_weights must be non-negative")
+            if not any(value > 0 for value in self.band_selection_weights):
+                raise ValueError("at least one band_selection_weight must be positive")
         if self.coverage_alpha < 0:
             raise ValueError("coverage_alpha must be non-negative")
         if self.greedy_batches < 1:

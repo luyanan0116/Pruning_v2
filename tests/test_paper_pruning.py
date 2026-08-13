@@ -81,13 +81,13 @@ def test_three_ablation_paths_and_lcb_variance():
             max_balls=16,
             min_event_classes=1,
         ),
-        lcb=LCBConfig(repeats=5, sample_fraction=0.75, lcb_lambda=1.0, random_state=7),
+        lcb=LCBConfig(repeats=1, sample_fraction=1.0, lcb_lambda=1.0, random_state=7),
     )
     result = score_layer(x, events, scenarios, cfg, layer_id=3)
-    assert result.bootstrap_scores.shape == (5, 24)
-    assert np.any(result.lcb_std > 0)
+    assert result.bootstrap_scores.shape == (1, 24)
+    assert np.all(result.lcb_std == 0)
     assert not np.allclose(result.mi_score, result.granular_score)
-    assert not np.allclose(result.granular_score, result.lcb_score)
+    assert np.allclose(result.granular_score, result.lcb_score)
 
 
 class ToyMLP(torch.nn.Module):
@@ -429,7 +429,8 @@ def test_probe_kde_scope_does_not_change_primary_granular_scores():
     assert np.isfinite(all_kde).all()
 
 
-def test_parallel_lcb_repeats_are_deterministic():
+
+def test_single_pass_lcb_has_zero_variance_and_matches_granular_score():
     x, events, scenarios = synthetic_responses(11)
     gb = GranularBallConfig(
         purity_thresholds=(0.55, 0.65),
@@ -442,33 +443,89 @@ def test_parallel_lcb_repeats_are_deterministic():
         worker_chunk_size=8,
         kde_scope="probe",
     )
-    base = dict(
-        frequency=FrequencyConfig(fine_bins=8, target_bands=4, mi_neighbors=2),
-        granular_ball=gb,
-    )
-    serial = score_layer(
+    result = score_layer(
         x,
         events,
         scenarios,
         PipelineConfig(
-            **base,
+            frequency=FrequencyConfig(fine_bins=8, target_bands=4, mi_neighbors=2),
+            granular_ball=gb,
             lcb=LCBConfig(
-                repeats=3, sample_fraction=0.75, random_state=19, workers=1
+                repeats=1, sample_fraction=1.0, random_state=19, workers=1
             ),
         ),
         layer_id=2,
     )
-    parallel = score_layer(
-        x,
-        events,
-        scenarios,
-        PipelineConfig(
-            **base,
-            lcb=LCBConfig(
-                repeats=3, sample_fraction=0.75, random_state=19, workers=3
-            ),
+    assert result.bootstrap_scores.shape[0] == 1
+    assert np.all(result.lcb_std == 0)
+    assert np.all(result.lcb_band_std == 0)
+    assert np.allclose(result.lcb_score, result.granular_score)
+    assert np.allclose(result.lcb_band_mean, result.granular_band_mi)
+
+
+def test_asymmetric_low_mid_high_coverage_profile_is_supported():
+    from lib.paper_pruning.budget import coverage_aware_keep_indices
+    from lib.paper_pruning.config import BudgetConfig
+
+    scores = np.linspace(0.0, 1.0, 30)
+    bands = np.zeros((30, 3), dtype=np.float64)
+    bands[:10, 0] = 1.0
+    bands[10:20, 1] = 1.0
+    bands[20:, 2] = 1.0
+    keep, priority, achieved = coverage_aware_keep_indices(
+        scores, bands, keep_count=15,
+        cfg=BudgetConfig(
+            coverage_ratios=(0.8, 0.6, 0.4),
+            coverage_alpha=2.0,
+            greedy_batches=15,
         ),
-        layer_id=2,
     )
-    assert np.array_equal(serial.bootstrap_scores, parallel.bootstrap_scores)
-    assert np.array_equal(serial.lcb_score, parallel.lcb_score)
+    assert keep.size == 15
+    assert priority.shape == (30,)
+    assert achieved.shape == (3,)
+    assert achieved[0] >= achieved[2]
+
+
+def test_lcb_only_and_band_only_can_select_different_units():
+    from lib.paper_pruning.budget import select_keep_indices
+    from lib.paper_pruning.config import BudgetConfig
+
+    lcb = np.array([0.99, 0.95, 0.90, 0.20, 0.10, 0.05])
+    bands = np.array([
+        [0.1, 0.0, 0.0],
+        [0.1, 0.0, 0.0],
+        [0.1, 0.0, 0.0],
+        [1.0, 0.8, 0.1],
+        [0.4, 1.0, 0.7],
+        [0.2, 0.4, 1.0],
+    ])
+    cfg = BudgetConfig(
+        coverage_ratios=(0.7, 0.6, 0.5),
+        band_selection_weights=(1.0, 0.7, 0.4),
+        coverage_alpha=1.0,
+        greedy_batches=6,
+    )
+    keep_lcb, _, _ = select_keep_indices("lcb_only", lcb, bands, 3, cfg)
+    keep_band, _, _ = select_keep_indices("band_only", lcb, bands, 3, cfg)
+    assert keep_lcb.size == keep_band.size == 3
+    assert not np.array_equal(keep_lcb, keep_band)
+
+
+def test_paper_hybrid_budget_remains_exact_with_three_bands():
+    from lib.paper_pruning.budget import select_keep_indices
+    from lib.paper_pruning.config import BudgetConfig
+
+    rng = np.random.default_rng(9)
+    scores = rng.normal(size=40)
+    bands = np.abs(rng.normal(size=(40, 3)))
+    cfg = BudgetConfig(
+        coverage_ratios=(0.85, 0.70, 0.55),
+        coverage_alpha=0.5,
+        greedy_batches=20,
+    )
+    keep, priority, achieved = select_keep_indices(
+        "paper_hybrid", scores, bands, 20, cfg
+    )
+    assert keep.size == 20
+    assert priority.shape == (40,)
+    assert achieved.shape == (3,)

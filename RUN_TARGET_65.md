@@ -56,11 +56,7 @@ PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 python -u run_paper_ablation.py \
   --paper_min_event_classes 2 \
   --paper_min_purity_gain 0.0 \
   --paper_min_radius_reduction 0.0 \
-  --paper_compactness_ratio 0.55 \
-  --paper_sample_fraction 0.8 \
-  --paper_scenario_fraction 1.0 \
-  --n_samples_lcb 10 \
-  --lcb_lambda 1.0 \
+  --paper_compactness_ratio 0.55 \    --lcb_lambda 1.0 \
   --paper_band_coverage_ratio 0.90 \
   --paper_coverage_alpha 0.25 \
   --paper_greedy_batches 64 \
