@@ -1,73 +1,89 @@
-# Pruning paper-aligned v7 strict structured
+# Pruning paper-aligned v6 fast
 
-本版本把 **Wanda 与论文主流程彻底分开**：
+This release keeps the v5 paper-aligned MI → granular-ball → repeated LCB → coverage/budget pipeline, while accelerating the strict per-unit granular-ball implementation. See `FAST_ACCELERATION_REPORT.md`.
 
-- `--prune_method wanda`：只作为普通 Wanda 权重级基线保留。
-- `--prune_method paper_mi_gb_lcb` / `paper_full`：不调用任何 Wanda metric、Wanda activation scale 或 Wanda mask。
-- 论文主路径最终生成全局保留集合 `K`，并剪完整 Attention 结构单元和 FFN 中间通道。
-
-## 严格主流程
-
-```text
-梯度响应
-→ 样本内标准化
-→ DCT
-→ 细粒度频带能量
-→ 任务驱动相邻频带合并
-→ MI
-→ 粒球局部化
-→ 多粒度融合
-→ 样本-场景双源重复估计
-→ LCB
-→ Eq.(11) 频带硬覆盖
-→ Eq.(12) 欠覆盖权重
-→ Eq.(13) 预算边际增益
-→ K
-→ 完整 Head/GQA bundle + FFN Channel
-→ 结构剪枝率
-→ PPL
-```
-
-## 推荐运行
+Recommended command for the paths used in this project:
 
 ```bash
 bash scripts/run_fast_paper_ablation.sh
 ```
 
-或：
-
-```bash
-python main.py \
-  --model /path/to/model \
-  --prune_method paper_mi_gb_lcb \
-  --sparsity_ratio 0.15 \
-  --paper_apply_mode shrink \
-  --paper_budget_metric params
-```
-
-## 输出
+Important fast-path controls:
 
 ```text
-paper_structured_report/
-  keep_set_K.json
-  prune_indices.json
-  all_contribution_scores_strict.csv
-  budget_selection_eq11_13.json
-  structural_pruning_manifest.json
+--paper_fast_small_mi       exact Numba JIT for small ball-level kNN MI
+--paper_kde_scope probe     KDE only on representative units; does not affect masks/PPL
+--paper_gb_workers 16-32    total unit-local CPU worker budget
+--paper_gb_chunk_size 64    amortizes thread scheduling overhead
+--paper_lcb_workers 2-4     deterministic parallel LCB repeats
 ```
 
-`structural_pruning_manifest.json` 同时报告：
-1. 完整结构单元剪枝率；
-2. 候选结构 cost-weighted 剪枝率；
-3. shrink 模式下整模型真实参数量下降比例。
+# Pruning Paper-Aligned v5
 
-## Wanda 保留范围
+基于 Wanda 工程骨架实现的论文对齐版本，主要对应：
 
-请看 `WANDA_AUDIT.md`。v6 中 Wanda 与论文主流程耦合的代码已经移出 active path，并原样归档在 `legacy/v6_wanda_paper/`，便于回查。普通 Wanda 基线仍由 `lib/prune.py::prune_wanda()` 与 `scripts/run_wanda_baseline.sh` 提供。
+- 频域互信息任务贡献谱；
+- 粒球多粒度局部互信息；
+- 样本-场景双源重复估计与 LCB；
+- 频带覆盖与预算约束下的贪心配置；
+- 顺序 Wanda 50% 权重剪枝低 PPL 验证路径；
+- 完整注意力头/FFN 通道结构化剪枝验证路径。
 
-## shrink 与 zero
+## 首先阅读
 
-- `--paper_apply_mode shrink`：物理缩小线性层张量维度，最符合“完整结构剪枝”。
-- `--paper_apply_mode zero`：完整单元置零但不改变张量形状，适合作为 Hugging Face 兼容性对照。
+- `PAPER_ALIGNMENT_REPORT.md`：逐公式、逐要求核对和修改说明。
+- `RUN_TARGET_65.md`：0.5 稀疏度与低 PPL 的运行命令和诊断阶梯。
+- `scripts/run_wanda_baseline.sh`：先确认服务器上的普通 Wanda 基线。
+- `scripts/run_target65_ablation.sh`：运行 MI、MI+GB、MI+GB+LCB 三组实验。
 
-注意：若各层保留维度不同，`shrink` 后不能仅凭一个全局 HF config 无损重建。代码会保存结构 manifest；PPL 评测在实际剪枝后的内存模型上完成。
+## 重要口径
+
+`wanda_weight` 表示七个线性矩阵中的 50% 权重稀疏，与 Wanda 的 PPL 口径接近。
+
+`structured_unit` 表示删除完整注意力头和 FFN 中间通道，更贴近论文“结构单元”语义，但完整结构单元 50% 剪除通常远比 Wanda 50% 权重稀疏激进。
+
+## 安装
+
+```bash
+conda activate lya_pruningv2
+python -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+## 测试
+
+```bash
+PYTHONPATH=. pytest -q
+```
+
+当前代码包包含 12 个单元测试，覆盖频域 MI、粒球嵌套划分、双源 bootstrap、LCB、覆盖预算、注意力/MLP mask 与 Wanda 回退一致性。
+
+## 快速启动
+
+```bash
+bash scripts/run_wanda_baseline.sh
+bash scripts/run_target65_ablation.sh
+```
+
+脚本中的模型和数据路径已经按以下服务器路径填写：
+
+```text
+/root/dw2/Lya/models/Llama-2-7b
+/root/dw2/Lya/dataset/dataset_c4
+/root/dw2/Lya/dataset/dataset_wikitext-raw
+```
+
+## 主要结果文件
+
+```text
+results/.../ablation_ppl_summary.csv
+results/.../shared_score_report/all_contribution_scores.csv
+results/.../shared_score_report/granular_ball_summary.csv
+results/.../shared_score_report/prune_indices.json
+results/.../shared_score_report/prune_batches_step10.json
+results/.../shared_score_report/mask_overlap.csv
+results/.../shared_score_report/weight_mask_summary_*.csv
+```
+
+## 真实性说明
+
+本代码包在本地完成了静态检查和单元测试，但没有用户服务器上的 Llama-2-7B、C4、WikiText-2 和 A100，因此没有宣称已经复现 PPL=6.5。请先运行普通 Wanda 基线，再运行论文引导消融。
