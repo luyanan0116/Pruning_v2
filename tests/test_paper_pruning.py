@@ -19,7 +19,9 @@ from lib.paper_pruning.selection import resolve_prune_count, select_bottom_k, sp
 from lib.paper_pruning.wanda_weight import (
     ALL_LINEAR_MODULES,
     allocate_row_prune_counts,
+    allocate_unit_sparsities,
     apply_paper_wanda_weight_masks_,
+    apply_paper_unit_budget_weight_masks_,
 )
 
 
@@ -300,6 +302,51 @@ def test_paper_scores_change_wanda_weight_masks():
             differences += int(torch.count_nonzero((a.weight == 0) != (b.weight == 0)).item())
     assert differences > 0
 
+
+
+def test_unit_budget_ratios_are_monotone_and_centered_at_target():
+    scores = np.array([0.90, 0.85, 0.80, 0.70, 0.20, 0.10, 0.05, 0.01])
+    ratios = allocate_unit_sparsities(
+        scores, target_ratio=0.5, min_ratio=0.30, max_ratio=0.70
+    )
+    order = np.argsort(scores)
+    # Higher score must never receive more pruning than a lower score.
+    assert np.all(np.diff(ratios[order]) <= 1e-12)
+    assert np.isclose(ratios.mean(), 0.5, atol=1e-12)
+    assert ratios[np.argmax(scores)] <= 0.301
+    assert ratios[np.argmin(scores)] >= 0.699
+
+
+def test_unit_budget_weight_masks_are_exact_and_score_aware():
+    torch.manual_seed(123)
+    model = ToyModel()
+    scores = _toy_scores(model)
+    summaries = apply_paper_unit_budget_weight_masks_(
+        model,
+        scores,
+        FakeResponseCache(model),
+        targets=("mlp", "attention"),
+        mlp_ratio=0.5,
+        attention_ratio=0.5,
+        min_unit_sparsity=0.30,
+        max_unit_sparsity=0.70,
+        chunk_rows=2,
+    )
+    assert len(summaries) == 2 * 7
+    for row in summaries:
+        assert abs(row["actual_ratio"] - 0.5) <= 1.0 / (row["rows"] * row["columns"])
+        assert row["unit_sparsity_min"] <= row["unit_sparsity_mean"] <= row["unit_sparsity_max"]
+
+    # gate_proj is row-oriented: low-score channel 0 should be pruned more
+    # than high-score channel 5.
+    gate = model.model.layers[0].mlp.gate_proj.weight
+    gate_ratios = (gate == 0).float().mean(dim=1)
+    assert gate_ratios[0] > gate_ratios[-1]
+
+    # down_proj is column-oriented and must obey the same unit budget.
+    down = model.model.layers[0].mlp.down_proj.weight
+    down_ratios = (down == 0).float().mean(dim=0)
+    assert down_ratios[0] > down_ratios[-1]
 
 def test_dual_source_bootstrap_preserves_valid_event_support():
     from lib.paper_pruning.resampling import dual_source_bootstrap_indices

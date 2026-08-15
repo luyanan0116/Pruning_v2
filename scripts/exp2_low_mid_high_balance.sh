@@ -6,7 +6,7 @@ RESULT_ROOT="${RESULT_ROOT:-paper_compare_results/exp2_frequency}"
 mkdir -p "$RESULT_ROOT"
 BASE=(
   --model "$MODEL_PATH" --prune_method paper_mi_gb_lcb --sparsity_ratio 0.5
-  --paper_prune_targets mlp,attention --paper_mask_style structured_unit
+  --paper_prune_targets mlp,attention --paper_mask_style unit_budget_weight --paper_unit_min_sparsity 0.30 --paper_unit_max_sparsity 0.70
   --paper_num_bands 3 --paper_final_keep_strategy paper_hybrid
   --paper_cache_dir "$CACHE_DIR" --paper_band_selection_weights 1.0,0.7,0.4
 )

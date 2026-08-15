@@ -36,6 +36,7 @@ from .paper_pruning.wanda_sequential import apply_sequential_paper_wanda_masks_
 from .paper_pruning.wanda_weight import (
     ALL_LINEAR_MODULES,
     apply_paper_wanda_weight_masks_,
+    apply_paper_unit_budget_weight_masks_,
     write_weight_mask_summary,
 )
 
@@ -528,10 +529,20 @@ def prune_paper(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
 
     mlp_ratio, _ = _target_budget(args, "mlp")
     attention_ratio, _ = _target_budget(args, "attention")
-    print(
-        f"applying {method} paper-guided Wanda weight masks for targets={','.join(targets)}; "
-        f"mlp_ratio={mlp_ratio:.4f}, attention_ratio={attention_ratio:.4f}"
-    )
+    unit_budget = args.paper_mask_style == "unit_budget_weight"
+    if unit_budget:
+        print(
+            f"applying {method} score-driven unit-budget weight masks; "
+            f"mlp_ratio={mlp_ratio:.4f}, attention_ratio={attention_ratio:.4f}, "
+            f"unit_sparsity=[{args.paper_unit_min_sparsity:.2f},"
+            f"{args.paper_unit_max_sparsity:.2f}]"
+        )
+    else:
+        print(
+            f"applying {method} paper-guided Wanda weight masks for targets={','.join(targets)}; "
+            f"mlp_ratio={mlp_ratio:.4f}, attention_ratio={attention_ratio:.4f}"
+        )
+
     if args.paper_wanda_sequential:
         summaries = apply_sequential_paper_wanda_masks_(
             model,
@@ -547,6 +558,21 @@ def prune_paper(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
             row_spread=args.paper_wanda_row_spread,
             row_temperature=args.paper_wanda_temperature,
             guidance_strength=args.paper_wanda_guidance_strength,
+            chunk_rows=args.paper_wanda_chunk_rows,
+            unit_budget=unit_budget,
+            min_unit_sparsity=args.paper_unit_min_sparsity,
+            max_unit_sparsity=args.paper_unit_max_sparsity,
+        )
+    elif unit_budget:
+        summaries = apply_paper_unit_budget_weight_masks_(
+            model,
+            unit_scores[method],
+            cache,
+            targets,
+            mlp_ratio=mlp_ratio,
+            attention_ratio=attention_ratio,
+            min_unit_sparsity=args.paper_unit_min_sparsity,
+            max_unit_sparsity=args.paper_unit_max_sparsity,
             chunk_rows=args.paper_wanda_chunk_rows,
         )
     else:
@@ -565,5 +591,5 @@ def prune_paper(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
         )
     summary_path = report_dir / f"weight_mask_summary_{method}.csv"
     write_weight_mask_summary(summary_path, summaries)
-    print(f"saved Wanda-style weight mask summary: {summary_path}")
+    print(f"saved weight mask summary: {summary_path}")
     return summaries

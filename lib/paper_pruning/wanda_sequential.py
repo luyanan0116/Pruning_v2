@@ -13,6 +13,7 @@ from .wanda_weight import (
     ATTENTION_MODULES,
     MLP_MODULES,
     apply_guided_wanda_module_,
+    apply_unit_budget_weight_module_,
     get_submodule,
     transformer_layers,
 )
@@ -147,6 +148,9 @@ def apply_sequential_paper_wanda_masks_(
     row_temperature: float = 1.0,
     guidance_strength: float = 0.01,
     chunk_rows: int = 256,
+    unit_budget: bool = False,
+    min_unit_sparsity: float = 0.30,
+    max_unit_sparsity: float = 0.70,
 ) -> list[dict]:
     """Official-Wanda-style sequential calibration and layerwise pruning.
 
@@ -228,22 +232,35 @@ def apply_sequential_paper_wanda_masks_(
                     )
                     ratio = attention_ratio if unit_type == "attention" else mlp_ratio
                     module = get_submodule(layer, module_name)
-                    summary = apply_guided_wanda_module_(
-                        module_name,
-                        module,
-                        wrappers[module_name].scaler_row,
-                        np.asarray(scores_by_type[unit_type][layer_id]),
-                        ratio,
-                        head_dim,
-                        row_spread=row_spread,
-                        row_temperature=row_temperature,
-                        guidance_strength=guidance_strength,
-                        chunk_rows=chunk_rows,
-                    )
+                    if unit_budget:
+                        summary = apply_unit_budget_weight_module_(
+                            module_name,
+                            module,
+                            wrappers[module_name].scaler_row,
+                            np.asarray(scores_by_type[unit_type][layer_id]),
+                            ratio,
+                            head_dim,
+                            min_unit_sparsity=min_unit_sparsity,
+                            max_unit_sparsity=max_unit_sparsity,
+                            chunk_rows=chunk_rows,
+                        )
+                    else:
+                        summary = apply_guided_wanda_module_(
+                            module_name,
+                            module,
+                            wrappers[module_name].scaler_row,
+                            np.asarray(scores_by_type[unit_type][layer_id]),
+                            ratio,
+                            head_dim,
+                            row_spread=row_spread,
+                            row_temperature=row_temperature,
+                            guidance_strength=guidance_strength,
+                            chunk_rows=chunk_rows,
+                        )
                     summary["layer"] = layer_id
                     summaries.append(summary)
                     print(
-                        f"  [sequential-wanda] layer={layer_id:02d} "
+                        f"  [{'sequential-unit-budget' if unit_budget else 'sequential-wanda'}] layer={layer_id:02d} "
                         f"module={module_name:<20} target={ratio:.4f} "
                         f"actual={summary['actual_ratio']:.6f}",
                         flush=True,

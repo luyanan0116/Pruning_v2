@@ -62,10 +62,11 @@ def main():
         "--paper_mask_style",
         type=str,
         default="structured_unit",
-        choices=["wanda_weight", "structured_unit"],
+        choices=["wanda_weight", "unit_budget_weight", "structured_unit"],
         help=(
-            "structured_unit is the paper-aligned default and removes complete MLP channels/heads; "
-            "wanda_weight is retained only as the legacy 50%-weight comparison baseline"
+            "structured_unit removes complete MLP channels/heads; "
+            "wanda_weight is the legacy weak-guidance weight baseline; "
+            "unit_budget_weight uses unit scores to assign different per-unit weight sparsities"
         ),
     )
     parser.add_argument("--paper_wanda_score_floor", type=float, default=0.05,
@@ -78,6 +79,10 @@ def main():
                         help="row chunk size used while building per-weight masks")
     parser.add_argument("--paper_wanda_guidance_strength", type=float, default=0.01,
                         help="gentle near-one MI/GB/LCB multiplier; 0 reproduces Wanda allocation")
+    parser.add_argument("--paper_unit_min_sparsity", type=float, default=0.30,
+                        help="minimum per-unit weight sparsity for unit_budget_weight; high-score units approach this")
+    parser.add_argument("--paper_unit_max_sparsity", type=float, default=0.70,
+                        help="maximum per-unit weight sparsity for unit_budget_weight; low-score units approach this")
     parser.add_argument("--paper_wanda_nsamples", type=int, default=128,
                         help="sequential Wanda calibration sample count")
     parser.add_argument("--paper_wanda_seqlen", type=int, default=2048,
@@ -191,7 +196,7 @@ def main():
                 parser.error("--paper_band_selection_weights length must equal --paper_num_bands")
             if any(value < 0 for value in band_weights) or not any(value > 0 for value in band_weights):
                 parser.error("band selection weights must be non-negative and not all zero")
-        if args.paper_mask_style == "wanda_weight":
+        if args.paper_mask_style in {"wanda_weight", "unit_budget_weight"}:
             if args.prune_per_layer > 0 or args.attention_prune_per_layer > 0:
                 parser.error(
                     "--prune_per_layer and --attention_prune_per_layer are only valid with "
@@ -209,8 +214,21 @@ def main():
                 parser.error("Wanda temperature and chunk rows must be positive")
             if args.paper_wanda_guidance_strength < 0:
                 parser.error("--paper_wanda_guidance_strength must be non-negative")
+            if args.paper_mask_style == "unit_budget_weight":
+                if not 0 <= args.paper_unit_min_sparsity < args.paper_unit_max_sparsity < 1:
+                    parser.error("--paper_unit_min_sparsity/--paper_unit_max_sparsity must satisfy 0 <= min < max < 1")
+                for label, value in (("MLP", mlp_ratio), ("attention", attn_ratio)):
+                    if label.lower() == "mlp" and "mlp" not in targets:
+                        continue
+                    if label == "attention" and "attention" not in targets:
+                        continue
+                    if not args.paper_unit_min_sparsity <= value <= args.paper_unit_max_sparsity:
+                        parser.error(
+                            f"{label} target sparsity {value} must lie within "
+                            "--paper_unit_min_sparsity/--paper_unit_max_sparsity"
+                        )
             if args.paper_wanda_nsamples < 4 or args.paper_wanda_seqlen < 8:
-                parser.error("sequential Wanda calibration settings are too small")
+                parser.error("sequential weight calibration settings are too small")
         else:
             if "mlp" in targets and args.prune_per_layer <= 0 and not 0 < mlp_ratio < 1:
                 parser.error("MLP pruning requires --prune_per_layer > 0 or a ratio in (0,1)")
