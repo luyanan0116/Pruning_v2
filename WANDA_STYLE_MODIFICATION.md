@@ -1,3 +1,5 @@
+> **v7 注意：** 本文件记录的是旧版实现。当前行为以 `V7_GLOBAL_BOOTSTRAP_ABLATION.md` 为准：已恢复真实双源 bootstrap/LCB，并采用 MI→GB→LCB→Full 四级干净消融与跨层全局预算。
+
 # v4 修改摘要
 
 ## 关键纠正

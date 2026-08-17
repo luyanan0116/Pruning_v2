@@ -83,12 +83,13 @@ def coverage_aware_keep_indices(
     cfg: BudgetConfig,
     costs: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Approximate proposal Eqs. (11)-(13) with per-band gamma_b targets.
+    """Greedy proposal Eq. (13): scalar score + current band deficit.
 
-    ``coverage_ratios`` implements the proposal's band-specific gamma_b. With
-    three contiguous bands, values such as (0.85, 0.70, 0.55) express the
-    requested low > mid > high retention profile without assigning a unit to
-    only one band; a unit may contribute to several bands.
+    Unlike the older coverage-first implementation, every greedy round always
+    includes the scalar MI/GB/LCB utility.  Frequency coverage is therefore a
+    compensating marginal-gain term rather than a separate stage that can
+    override task contribution.  ``greedy_batches`` controls a scalable batched
+    approximation; setting it >= ``keep_count`` gives one-at-a-time greedy.
     """
     cfg.validate()
     raw_score = np.asarray(scores, dtype=np.float64).reshape(-1)
@@ -107,54 +108,46 @@ def coverage_aware_keep_indices(
 
     score_term = _rank01(raw_score) / cost
     normalized_bands = _normalized_positive_bands(bands)
+    positive_bands = np.maximum(np.nan_to_num(bands, nan=0.0), 0.0)
+    # Marginal utility uses within-band relative contribution (max=1), while
+    # achieved coverage keeps the column-sum normalization used by Eq. (11).
+    # This avoids making the coverage term vanish merely because a band has
+    # thousands of candidate units in the global pool.
+    relative_band_utility = positive_bands / np.maximum(
+        positive_bands.max(axis=0, keepdims=True), 1e-12
+    )
     target_coverage = _coverage_targets(cfg, bands.shape[1])
     current_coverage = np.zeros(bands.shape[1], dtype=np.float64)
     selected = np.zeros(unit_count, dtype=bool)
-    priority_accumulator = np.zeros(unit_count, dtype=np.float64)
+    priority_accumulator = np.full(unit_count, -np.inf, dtype=np.float64)
     remaining = keep_count
     batch_size = max(1, int(np.ceil(keep_count / cfg.greedy_batches)))
 
-    # Coverage-first allocation approximates the hard constraint in Eq. (11).
-    # At each step we serve the band with the largest absolute coverage deficit.
-    # Therefore asymmetric gamma_b values such as low/mid/high=(.85,.70,.55)
-    # naturally allocate more of a tight fixed budget to low frequency while
-    # still allowing one unit to satisfy several bands simultaneously.
-    blocked = np.zeros(bands.shape[1], dtype=bool)
     while remaining > 0:
         under = np.maximum(0.0, target_coverage - current_coverage)
-        under[blocked] = 0.0
-        if under.max(initial=0.0) <= 1e-12:
-            break
-        band = int(np.argmax(under))
-        candidates = np.flatnonzero((~selected) & (normalized_bands[:, band] > 0))
-        if candidates.size == 0:
-            blocked[band] = True
-            continue
-        utility = normalized_bands[candidates, band] / cost[candidates]
-        best_value = utility.max(initial=0.0)
-        best_candidates = candidates[np.flatnonzero(utility == best_value)]
-        if best_candidates.size > 1:
-            best = int(best_candidates[np.argmax(score_term[best_candidates])])
-        else:
-            best = int(best_candidates[0])
-        selected[best] = True
-        priority_accumulator[best] = score_term[best] + cfg.coverage_alpha * under[band]
-        current_coverage += normalized_bands[best]
-        remaining -= 1
-
-    while remaining > 0:
-        under = np.maximum(0.0, target_coverage - current_coverage)
-        marginal = score_term + cfg.coverage_alpha * (normalized_bands @ under) / cost
+        coverage_gain = (relative_band_utility @ under) / cost
+        marginal = score_term + cfg.coverage_alpha * coverage_gain
         marginal[selected] = -np.inf
         take = min(batch_size, remaining)
-        candidate = np.argpartition(marginal, -take)[-take:]
-        candidate = candidate[np.argsort(marginal[candidate], kind="stable")]
+        available = np.flatnonzero(~selected)
+        if take >= available.size:
+            candidate = available
+        else:
+            local = marginal[available]
+            positions = np.argpartition(local, -take)[-take:]
+            candidate = available[positions]
+        # Stable descending order makes tie behavior deterministic and lets the
+        # priority vector preserve the actual marginal-gain ordering.
+        candidate = candidate[np.lexsort((candidate, -marginal[candidate]))]
         selected[candidate] = True
         priority_accumulator[candidate] = marginal[candidate]
         current_coverage += normalized_bands[candidate].sum(axis=0)
-        remaining -= take
+        remaining -= candidate.size
 
     keep = np.flatnonzero(selected).astype(np.int64)
+    # For downstream Wanda guidance, retain the global scalar rank for every
+    # unit and boost selected units according to the marginal gains that caused
+    # their inclusion.
     final_priority = score_term.copy()
     selected_values = priority_accumulator[selected]
     if selected_values.size:

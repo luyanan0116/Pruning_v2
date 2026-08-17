@@ -20,7 +20,7 @@ from .pipeline import LayerAblationScores
 from .selection import split_into_steps
 
 
-METHOD_KEYS = ("paper_mi", "paper_mi_gb", "paper_mi_gb_lcb")
+METHOD_KEYS = ("paper_mi", "paper_mi_gb", "paper_mi_gb_lcb", "paper_full")
 
 
 class LayerReportWriter:
@@ -58,7 +58,7 @@ class LayerReportWriter:
     def _score_fields(self):
         fields = [
             "unit_type", "layer", "unit", "mi_total", "granular_total", "lcb_mean", "lcb_std", "lcb_score",
-            "mi_pruned", "granular_pruned", "lcb_pruned",
+            "mi_pruned", "granular_pruned", "lcb_pruned", "full_pruned",
         ]
         for band in range(self.band_count):
             fields.extend([
@@ -99,6 +99,11 @@ class LayerReportWriter:
             })
 
         selected_sets = {key: set(np.asarray(value, dtype=np.int64).tolist()) for key, value in selections.items()}
+        def pruned_flag(key: str, unit: int):
+            if key not in selected_sets:
+                return ""
+            return unit in selected_sets[key]
+
         for unit in range(scores.mi_score.size):
             row = {
                 "unit_type": unit_type,
@@ -109,9 +114,10 @@ class LayerReportWriter:
                 "lcb_mean": float(scores.lcb_mean[unit]),
                 "lcb_std": float(scores.lcb_std[unit]),
                 "lcb_score": float(scores.lcb_score[unit]),
-                "mi_pruned": unit in selected_sets["paper_mi"],
-                "granular_pruned": unit in selected_sets["paper_mi_gb"],
-                "lcb_pruned": unit in selected_sets["paper_mi_gb_lcb"],
+                "mi_pruned": pruned_flag("paper_mi", unit),
+                "granular_pruned": pruned_flag("paper_mi_gb", unit),
+                "lcb_pruned": pruned_flag("paper_mi_gb_lcb", unit),
+                "full_pruned": pruned_flag("paper_full", unit),
             }
             for band in range(self.band_count):
                 row[f"global_band_mi_{band}"] = float(scores.global_spectrum.band_mi[unit, band])
@@ -270,6 +276,39 @@ def _flatten_mask(mask: Mapping[str, Mapping[int, np.ndarray]]):
         for layer, values in layer_map.items()
         for unit in np.asarray(values)
     }
+
+
+def write_global_selection_status(
+    output_dir: str | Path,
+    selections: Mapping[str, Mapping[str, Mapping[int, np.ndarray]]],
+    unit_counts: Mapping[str, Mapping[int, int]],
+) -> Path:
+    """Write final cross-layer selection flags without retaining huge score tensors."""
+    output = Path(output_dir)
+    path = output / "global_selection_status.csv"
+    methods = list(selections)
+    fields = ["unit_type", "layer", "unit"] + [f"{method}_pruned" for method in methods]
+    selected = {
+        method: {
+            unit_type: {
+                int(layer): set(np.asarray(indices, dtype=np.int64).tolist())
+                for layer, indices in layer_map.items()
+            }
+            for unit_type, layer_map in type_map.items()
+        }
+        for method, type_map in selections.items()
+    }
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for unit_type, layer_map in unit_counts.items():
+            for layer, count in sorted(layer_map.items()):
+                for unit in range(int(count)):
+                    row = {"unit_type": unit_type, "layer": int(layer), "unit": unit}
+                    for method in methods:
+                        row[f"{method}_pruned"] = unit in selected.get(method, {}).get(unit_type, {}).get(int(layer), set())
+                    writer.writerow(row)
+    return path
 
 
 def write_selection_files(

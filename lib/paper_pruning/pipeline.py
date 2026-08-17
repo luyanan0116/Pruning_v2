@@ -8,6 +8,7 @@ import numpy as np
 from .config import PipelineConfig
 from .granular_ball import GranularityResult, multi_granularity_local_mi
 from .mi import FrequencySpectrum, build_frequency_spectrum, weighted_total_mi
+from .resampling import dual_source_bootstrap_indices, stratified_bootstrap_indices
 
 
 @dataclass
@@ -27,6 +28,44 @@ class LayerAblationScores:
     lcb_band_std: np.ndarray
 
 
+def _bootstrap_indices(
+    events: np.ndarray,
+    scenario_ids: Optional[np.ndarray],
+    base_sample_ids: Optional[np.ndarray],
+    config: PipelineConfig,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Draw one resample matching the proposal's sample/scenario uncertainty.
+
+    When both base-sample and scenario identifiers are available, the default
+    is a two-stage bootstrap: resample base calibration examples, then resample
+    scenario realizations within every selected base example.  Otherwise fall
+    back to event-stratified (optionally event+scenario stratified) bootstrap.
+    """
+    lcb_cfg = config.lcb
+    if (
+        lcb_cfg.cluster_by_base_sample
+        and base_sample_ids is not None
+        and scenario_ids is not None
+    ):
+        return dual_source_bootstrap_indices(
+            events,
+            base_sample_ids,
+            scenario_ids,
+            sample_fraction=lcb_cfg.sample_fraction,
+            scenario_fraction=lcb_cfg.scenario_fraction,
+            rng=rng,
+        )
+    stratify_scenarios = (
+        scenario_ids if lcb_cfg.stratify_by_scenario and scenario_ids is not None else None
+    )
+    return stratified_bootstrap_indices(
+        events,
+        lcb_cfg.sample_fraction,
+        rng,
+        scenario_ids=stratify_scenarios,
+    )
+
 
 def score_layer(
     responses: np.ndarray,
@@ -36,11 +75,13 @@ def score_layer(
     layer_id: int = 0,
     base_sample_ids: Optional[np.ndarray] = None,
 ) -> LayerAblationScores:
-    """Compute MI and MI+granular-ball once.
+    """Compute MI, granular-ball score, and repeated-estimation LCB.
 
-    This build intentionally disables repeated LCB estimation. The single
-    granular-ball contribution is reused as the LCB mean, standard deviation
-    is fixed to zero, and therefore LCB equals the one-pass contribution score.
+    The full-data frequency decomposition fixes the task-driven band boundaries
+    once.  LCB repeats then resample observations and recompute the granular
+    local-MI estimator on those same bands.  This gives comparable per-band
+    bootstrap samples while still reflecting both calibration-sample and
+    scenario uncertainty.
     """
     config.validate()
     x = np.asarray(responses)
@@ -77,22 +118,52 @@ def score_layer(
     )
     granular_score = weighted_total_mi(granular_band_mi, config.frequency)
 
-    # Single-pass mode requested by the experiment:
-    # no bootstrap/resampling loop and no repeated granular-ball/MI computation.
-    # The one granular-ball estimate computed above is used directly.
-    bootstrap = granular_score[None, :].copy()
-    bootstrap_bands = granular_band_mi[None, :, :].copy()
+    repeats = int(config.lcb.repeats)
+    if repeats == 1:
+        # Compatibility/debug mode: one full-data estimate has no empirical
+        # variance, therefore LCB equals the granular score by definition.
+        bootstrap = granular_score[None, :].copy()
+        bootstrap_bands = granular_band_mi[None, :, :].copy()
+    else:
+        bootstrap = np.empty((repeats, granular_score.size), dtype=np.float64)
+        bootstrap_bands = np.empty(
+            (repeats, granular_band_mi.shape[0], granular_band_mi.shape[1]),
+            dtype=np.float64,
+        )
+        rng = np.random.default_rng(config.lcb.random_state + 1009 * int(layer_id))
+        for repeat in range(repeats):
+            indices = _bootstrap_indices(y, scenarios, base_ids, config, rng)
+            sampled_bands, _sampled_kde, _ = multi_granularity_local_mi(
+                spectrum.band_energy[indices],
+                y[indices],
+                config.frequency,
+                config.granular_ball,
+                compute_kde=False,
+                kde_unit_indices=np.empty(0, dtype=np.int64),
+                build_details=False,
+            )
+            bootstrap_bands[repeat] = sampled_bands
+            bootstrap[repeat] = weighted_total_mi(sampled_bands, config.frequency)
+            if repeat == 0 or (repeat + 1) == repeats or (repeat + 1) % 5 == 0:
+                print(
+                    f"[paper LCB] layer-key={layer_id} repeat {repeat + 1}/{repeats} "
+                    f"n={indices.size}",
+                    flush=True,
+                )
 
-    mean = granular_score.copy()
-    std = np.zeros_like(mean)
+    # Population std (ddof=0) is deliberately used because these repeated
+    # estimates are an empirical uncertainty distribution rather than an
+    # unbiased estimator of a separate sample variance parameter.
+    mean = bootstrap.mean(axis=0)
+    std = bootstrap.std(axis=0, ddof=0)
     lcb = mean - config.lcb.lcb_lambda * std
-
-    band_mean = granular_band_mi.copy()
-    band_std = np.zeros_like(band_mean)
+    band_mean = bootstrap_bands.mean(axis=0)
+    band_std = bootstrap_bands.std(axis=0, ddof=0)
 
     print(
-        "[paper LCB] single-pass mode: repeated estimation disabled; "
-        "std=0, so LCB equals the single granular-ball contribution score",
+        f"[paper LCB] repeats={repeats}, sample_fraction={config.lcb.sample_fraction:.3f}, "
+        f"scenario_fraction={config.lcb.scenario_fraction:.3f}, "
+        f"lambda={config.lcb.lcb_lambda:.3f}, mean_std={std.mean():.6g}",
         flush=True,
     )
 

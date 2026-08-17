@@ -541,6 +541,7 @@ def apply_paper_wanda_weight_masks_(
     temperature: float = 1.0,
     guidance_strength: float = 0.05,
     chunk_rows: int = 256,
+    layer_ratios: Mapping[str, Mapping[int, float]] | None = None,
 ) -> list[dict]:
     """Legacy non-sequential application; sequential mode is recommended."""
     del score_floor
@@ -562,7 +563,11 @@ def apply_paper_wanda_weight_masks_(
             for module_name in module_names:
                 module = get_submodule(layer, module_name)
                 unit_type = "attention" if module_name.startswith("self_attn.") else "mlp"
-                ratio = attention_ratio if unit_type == "attention" else mlp_ratio
+                base_ratio = attention_ratio if unit_type == "attention" else mlp_ratio
+                ratio = float(
+                    layer_ratios.get(unit_type, {}).get(layer_id, base_ratio)
+                    if layer_ratios is not None else base_ratio
+                )
                 input_scale = torch.as_tensor(
                     response_cache.load_activation_scale(layer_id, module_name),
                     device=module.weight.device,
@@ -596,6 +601,7 @@ def apply_paper_unit_budget_weight_masks_(
     min_unit_sparsity: float = 0.30,
     max_unit_sparsity: float = 0.70,
     chunk_rows: int = 256,
+    layer_ratios: Mapping[str, Mapping[int, float]] | None = None,
 ) -> list[dict]:
     """Apply score-driven per-unit weight budgets without structural deletion."""
     layers = transformer_layers(model)
@@ -618,7 +624,11 @@ def apply_paper_unit_budget_weight_masks_(
             for module_name in module_names:
                 module = get_submodule(layer, module_name)
                 unit_type = "attention" if module_name.startswith("self_attn.") else "mlp"
-                ratio = attention_ratio if unit_type == "attention" else mlp_ratio
+                base_ratio = attention_ratio if unit_type == "attention" else mlp_ratio
+                ratio = float(
+                    layer_ratios.get(unit_type, {}).get(layer_id, base_ratio)
+                    if layer_ratios is not None else base_ratio
+                )
                 input_scale = torch.as_tensor(
                     response_cache.load_activation_scale(layer_id, module_name),
                     device=module.weight.device,

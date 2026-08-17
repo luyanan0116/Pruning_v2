@@ -57,12 +57,15 @@ class GranularBallConfig:
     min_radius_reduction: float = 0.0
     compactness_ratio: float = 0.55
     min_event_classes: int = 2
+    min_event_count_per_class: int = 2
     kmeans_iterations: int = 12
     localization_mode: str = "layer_shared"
     workers: int = 1
     worker_chunk_size: int = 64
     kde_scope: str = "probe"
     variance_floor: float = 1e-8
+    fusion_mode: str = "inverse_sqrt_dispersion"
+    fusion_max_ratio: float = 5.0
     random_state: int = 0
 
     def validate(self) -> None:
@@ -84,6 +87,8 @@ class GranularBallConfig:
             raise ValueError("compactness_ratio must be in (0, 1]")
         if self.min_event_classes < 1:
             raise ValueError("min_event_classes must be >= 1")
+        if self.min_event_count_per_class < 1:
+            raise ValueError("min_event_count_per_class must be >= 1")
         if self.localization_mode not in {"layer_shared", "unit_local"}:
             raise ValueError("localization_mode must be layer_shared or unit_local")
         if self.workers < 1:
@@ -94,15 +99,19 @@ class GranularBallConfig:
             raise ValueError("kde_scope must be all, probe or none")
         if self.variance_floor <= 0:
             raise ValueError("variance_floor must be positive")
+        if self.fusion_mode not in {"equal", "inverse_sqrt_dispersion", "inverse_dispersion"}:
+            raise ValueError("fusion_mode must be equal, inverse_sqrt_dispersion or inverse_dispersion")
+        if self.fusion_max_ratio < 1:
+            raise ValueError("fusion_max_ratio must be >= 1")
 
 
 @dataclass(frozen=True)
 class LCBConfig:
     """Paper equations (9)-(10) / detailed equations (25)-(27)."""
 
-    repeats: int = 1
+    repeats: int = 10
     sample_fraction: float = 0.8
-    scenario_fraction: float = 1.0
+    scenario_fraction: float = 0.67
     lcb_lambda: float = 1.0
     stratify_by_scenario: bool = True
     cluster_by_base_sample: bool = True
@@ -110,8 +119,8 @@ class LCBConfig:
     workers: int = 1
 
     def validate(self) -> None:
-        if self.repeats != 1:
-            raise ValueError("single-pass build requires repeats == 1")
+        if self.repeats < 1:
+            raise ValueError("repeats must be >= 1")
         if not 0 < self.sample_fraction <= 1:
             raise ValueError("sample_fraction must be in (0, 1]")
         if not 0 < self.scenario_fraction <= 1:

@@ -159,6 +159,14 @@ def split_ball(
         for child in children
     ):
         return None
+    # A geometrically compact/pure child is not useful if the local MI estimator
+    # becomes degenerate.  Reject splits that would create a child with too few
+    # observations in any represented event class.  This prevents the
+    # "high-purity -> invalid MI -> zero contribution" failure mode.
+    for child in children:
+        _classes, counts = np.unique(events[child.indices], return_counts=True)
+        if counts.size and counts.min() < cfg.min_event_count_per_class:
+            return None
 
     weighted_purity = sum(child.size * child.purity for child in children) / ball.size
     purity_gain = weighted_purity - ball.purity
@@ -313,14 +321,23 @@ def _aggregate_partition_from_cache(
     kde_result = np.zeros((n_units, n_bands), dtype=np.float64)
     totals = []
     weights = []
+    valid_items = []
     for ball in balls:
         item = cache[_ball_key(ball)]
-        if not item.valid:
-            continue
-        knn_result += item.sample_weight * item.knn
-        kde_result += item.sample_weight * item.kde
-        totals.append(item.total)
-        weights.append(item.sample_weight)
+        if item.valid:
+            valid_items.append(item)
+
+    # Invalid local balls are omitted, but the remaining valid sample mass must
+    # be renormalized to one.  Without this, finer granularities are
+    # systematically shrunk whenever even one local MI estimate is invalid.
+    valid_mass = float(sum(item.sample_weight for item in valid_items))
+    if valid_mass > 0:
+        for item in valid_items:
+            normalized_weight = item.sample_weight / valid_mass
+            knn_result += normalized_weight * item.knn
+            kde_result += normalized_weight * item.kde
+            totals.append(item.total)
+            weights.append(normalized_weight)
 
     if len(totals) <= 1:
         dispersion = 0.0
@@ -396,22 +413,30 @@ def local_mi_for_partition(
 def _fusion_weights(
     dispersions: Sequence[float], gb_cfg: GranularBallConfig
 ) -> np.ndarray:
+    dispersion = np.asarray(dispersions, dtype=np.float64)
     if gb_cfg.granularity_weights is not None:
         weights = np.asarray(gb_cfg.granularity_weights, dtype=np.float64)
-    else:
-        weights = 1.0 / (
-            np.asarray(dispersions, dtype=np.float64) + gb_cfg.variance_floor
-        )
-        if (
-            not np.isfinite(weights).all()
-            or weights.max() / max(weights.min(), 1e-30) > 1e12
-        ):
-            finite = np.asarray(dispersions, dtype=np.float64)
-            if np.all(finite <= gb_cfg.variance_floor):
-                weights = np.ones_like(finite)
+    elif gb_cfg.fusion_mode == "equal":
+        weights = np.ones_like(dispersion)
+    elif gb_cfg.fusion_mode == "inverse_sqrt_dispersion":
+        weights = 1.0 / np.sqrt(np.maximum(dispersion, 0.0) + gb_cfg.variance_floor)
+    else:  # inverse_dispersion
+        weights = 1.0 / (np.maximum(dispersion, 0.0) + gb_cfg.variance_floor)
+
+    weights = np.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
     weights = np.maximum(weights, 0.0)
     if weights.sum() <= 0:
-        weights = np.ones_like(weights)
+        weights = np.ones_like(dispersion)
+
+    # Prevent one nearly-zero-dispersion granularity from swallowing all other
+    # levels.  The proposal calls for multi-granularity fusion, so the default
+    # must remain genuinely multi-level rather than collapsing to one snapshot.
+    positive = weights[weights > 0]
+    if positive.size:
+        floor = positive.max() / float(gb_cfg.fusion_max_ratio)
+        weights = np.where(weights > 0, np.maximum(weights, floor), 0.0)
+    if weights.sum() <= 0:
+        weights = np.ones_like(dispersion)
     return weights / weights.sum()
 
 

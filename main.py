@@ -42,12 +42,18 @@ def main():
         choices=[
             "magnitude", "wanda", "sparsegpt",
             "ablate_mag_seq", "ablate_wanda_seq", "ablate_mag_iter", "ablate_wanda_iter",
-            "search", "lcb", "paper_mi", "paper_mi_gb", "paper_mi_gb_lcb",
+            "search", "lcb", "paper_mi", "paper_mi_gb", "paper_mi_gb_lcb", "paper_full",
         ],
     )
 
     # Paper-aligned ablation: Eq. (1)-(10) in the uploaded proposal.
     parser.add_argument("--lcb_lambda", type=float, default=1.0, help="LCB risk coefficient lambda")
+    parser.add_argument("--paper_lcb_repeats", type=int, default=10,
+                        help="repeated sample/scenario bootstrap estimates used by the real LCB")
+    parser.add_argument("--paper_lcb_sample_fraction", type=float, default=0.8,
+                        help="fraction of base calibration samples drawn per LCB repeat")
+    parser.add_argument("--paper_lcb_scenario_fraction", type=float, default=0.67,
+                        help="fraction of scenario realizations drawn per selected base sample")
     parser.add_argument("--prune_per_layer", type=int, default=0,
                         help="exact MLP channels removed per layer; 0 uses mlp_sparsity_ratio/sparsity_ratio")
     parser.add_argument("--attention_prune_per_layer", type=int, default=0,
@@ -129,6 +135,13 @@ def main():
     parser.add_argument("--paper_min_radius_reduction", type=float, default=0.0)
     parser.add_argument("--paper_compactness_ratio", type=float, default=0.55)
     parser.add_argument("--paper_min_event_classes", type=int, default=2)
+    parser.add_argument("--paper_min_event_count_per_ball", type=int, default=2,
+                        help="minimum observations per represented event class in every accepted child ball")
+    parser.add_argument("--paper_gb_fusion_mode", type=str, default="inverse_sqrt_dispersion",
+                        choices=["equal", "inverse_sqrt_dispersion", "inverse_dispersion"],
+                        help="multi-granularity fusion rule; inverse-sqrt is the robust default")
+    parser.add_argument("--paper_gb_fusion_max_ratio", type=float, default=5.0,
+                        help="maximum raw fusion-weight ratio between granularities")
     parser.add_argument("--paper_band_coverage_ratio", type=float, default=0.90,
                         help="uniform fallback gamma when per-band ratios are not supplied")
     parser.add_argument("--paper_band_coverage_ratios", type=str, default=None,
@@ -141,11 +154,16 @@ def main():
         default="paper_hybrid",
         choices=["paper_hybrid", "lcb_only", "band_only"],
         help=(
-            "paper_hybrid uses scalar score/LCB plus frequency under-coverage; "
-            "lcb_only keeps by scalar LCB; band_only keeps by frequency contribution only"
+            "applies to paper_full only: paper_hybrid uses LCB plus frequency under-coverage; "
+            "lcb_only disables coverage; band_only is a diagnostic frequency-only selector. "
+            "paper_mi, paper_mi_gb and paper_mi_gb_lcb are always clean score-only ablations"
         ),
     )
     parser.add_argument("--paper_coverage_alpha", type=float, default=0.25)
+    parser.add_argument("--paper_global_budget", action=argparse.BooleanOptionalAction, default=True,
+                        help="allocate each unit type's total pruning budget jointly across all layers")
+    parser.add_argument("--paper_global_layer_spread", type=float, default=0.10,
+                        help="for weight-mask modes, max layer sparsity deviation around the global target")
     parser.add_argument("--paper_greedy_batches", type=int, default=64)
     parser.add_argument("--paper_cache_dir", type=str, default="paper_response_cache")
     parser.add_argument("--paper_report_dir", type=str, default="paper_ablation_report")
@@ -196,6 +214,18 @@ def main():
                 parser.error("--paper_band_selection_weights length must equal --paper_num_bands")
             if any(value < 0 for value in band_weights) or not any(value > 0 for value in band_weights):
                 parser.error("band selection weights must be non-negative and not all zero")
+        if not 0 <= args.paper_global_layer_spread < 1:
+            parser.error("--paper_global_layer_spread must be in [0,1)")
+        if args.paper_lcb_repeats < 1:
+            parser.error("--paper_lcb_repeats must be >= 1")
+        if not 0 < args.paper_lcb_sample_fraction <= 1:
+            parser.error("--paper_lcb_sample_fraction must be in (0,1]")
+        if not 0 < args.paper_lcb_scenario_fraction <= 1:
+            parser.error("--paper_lcb_scenario_fraction must be in (0,1]")
+        if args.paper_min_event_count_per_ball < 1:
+            parser.error("--paper_min_event_count_per_ball must be >= 1")
+        if args.paper_gb_fusion_max_ratio < 1:
+            parser.error("--paper_gb_fusion_max_ratio must be >= 1")
         if args.paper_mask_style in {"wanda_weight", "unit_budget_weight"}:
             if args.prune_per_layer > 0 or args.attention_prune_per_layer > 0:
                 parser.error(

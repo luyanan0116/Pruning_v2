@@ -1,3 +1,28 @@
+# Pruning paper-aligned v7
+
+当前版本已恢复真正的样本-场景双源 bootstrap/LCB，并把配置生成改为跨层全局预算。消融固定为 **MI → MI+GB → MI+GB+LCB → Full(LCB+频带覆盖)**。完整改动见 `V7_GLOBAL_BOOTSTRAP_ABLATION.md`，推荐入口为：
+
+```bash
+bash scripts/run_v7_clean_ablation.sh
+```
+
+关键新增参数：
+
+```text
+--paper_lcb_repeats 10
+--paper_lcb_sample_fraction 0.8
+--paper_lcb_scenario_fraction 0.67
+--paper_min_event_count_per_ball 2
+--paper_gb_fusion_mode inverse_sqrt_dispersion
+--paper_gb_fusion_max_ratio 5
+--paper_global_budget
+--paper_global_layer_spread 0.10
+```
+
+测试：`PYTHONPATH=. pytest -q`。当前包内测试覆盖真实 LCB 方差、invalid-ball 重新归一化、融合权重上限和 coverage+scalar 联合贪心。
+
+---
+
 # Pruning paper-aligned v6 fast
 
 This release keeps the v5 paper-aligned MI → granular-ball → repeated LCB → coverage/budget pipeline, while accelerating the strict per-unit granular-ball implementation. See `FAST_ACCELERATION_REPORT.md`.
@@ -86,17 +111,3 @@ results/.../shared_score_report/weight_mask_summary_*.csv
 ## 真实性说明
 
 本代码包在本地完成了静态检查和单元测试，但没有用户服务器上的 Llama-2-7B、C4、WikiText-2 和 A100，因此没有宣称已经复现 PPL=6.5。请先运行普通 Wanda 基线，再运行论文引导消融。
-
-## Single-pass change
-
-This build removes the repeated LCB/bootstrap computation. MI and granular-ball
-localization are computed once on the available calibration/scenario observations.
-
-Consequences:
-
-- no 20/10/N-times repeated scoring loop;
-- `lcb_std = 0`;
-- `LCB = one-pass granular-ball contribution score`;
-- frequency-band coverage and `paper_hybrid` configuration selection remain active.
-
-This is faster, but it no longer estimates uncertainty from repeated samples.

@@ -30,6 +30,7 @@ from .paper_pruning.reporting import (
     plot_unit_local_granular_balls,
     plot_lcb_scores,
     write_selection_files,
+    write_global_selection_status,
 )
 from .paper_pruning.selection import resolve_prune_count, select_bottom_k
 from .paper_pruning.wanda_sequential import apply_sequential_paper_wanda_masks_
@@ -41,8 +42,8 @@ from .paper_pruning.wanda_weight import (
 )
 
 
-PAPER_METHODS = {"paper_mi", "paper_mi_gb", "paper_mi_gb_lcb", "lcb"}
-METHODS = ("paper_mi", "paper_mi_gb", "paper_mi_gb_lcb")
+PAPER_METHODS = {"paper_mi", "paper_mi_gb", "paper_mi_gb_lcb", "paper_full", "lcb"}
+METHODS = ("paper_mi", "paper_mi_gb", "paper_mi_gb_lcb", "paper_full")
 
 
 def _parse_float_tuple(raw: str) -> tuple[float, ...]:
@@ -114,19 +115,22 @@ def _pipeline_config(args) -> PipelineConfig:
             min_radius_reduction=args.paper_min_radius_reduction,
             compactness_ratio=args.paper_compactness_ratio,
             min_event_classes=args.paper_min_event_classes,
+            min_event_count_per_class=args.paper_min_event_count_per_ball,
             localization_mode=args.paper_gb_localization,
             workers=args.paper_gb_workers,
             worker_chunk_size=args.paper_gb_chunk_size,
             kde_scope=args.paper_kde_scope,
+            fusion_mode=args.paper_gb_fusion_mode,
+            fusion_max_ratio=args.paper_gb_fusion_max_ratio,
             random_state=args.seed,
         ),
         lcb=LCBConfig(
-            repeats=1,
-            sample_fraction=1.0,
-            scenario_fraction=1.0,
+            repeats=args.paper_lcb_repeats,
+            sample_fraction=args.paper_lcb_sample_fraction,
+            scenario_fraction=args.paper_lcb_scenario_fraction,
             lcb_lambda=args.lcb_lambda,
-            stratify_by_scenario=False,
-            cluster_by_base_sample=False,
+            stratify_by_scenario=True,
+            cluster_by_base_sample=True,
             random_state=args.seed,
             workers=1,
         ),
@@ -173,6 +177,9 @@ def _config_payload(args, config: PipelineConfig, cache, targets: tuple[str, ...
         },
         "prune_step": int(args.paper_prune_step),
         "final_keep_strategy": args.paper_final_keep_strategy,
+        "global_budget": bool(args.paper_global_budget),
+        "global_layer_spread": float(args.paper_global_layer_spread),
+        "ablation_design": "MI(score-only)->GB(score-only)->LCB(score-only)->Full(LCB+coverage)",
         "response_cache": str(cache.root.resolve()),
         "num_observations": cache.num_observations,
         "response_length": cache.response_length,
@@ -228,6 +235,19 @@ def _score_or_load(
     Dict[str, Dict[str, Dict[int, np.ndarray]]],
     Dict[str, Dict[str, Dict[int, np.ndarray]]],
 ]:
+    """Score every layer first, then allocate the pruning budget globally.
+
+    The clean ablation is intentionally fixed as:
+      paper_mi         = MI score only
+      paper_mi_gb      = granular-ball score only
+      paper_mi_gb_lcb  = true repeated-estimation LCB score only
+      paper_full       = LCB + frequency-coverage marginal gain
+
+    With ``--paper_global_budget`` (default), the total budget for each unit
+    type is pooled across all layers.  The total number of pruned units remains
+    exactly the sum of the legacy per-layer budgets, but sensitive layers are no
+    longer forced to prune the same fraction as redundant layers.
+    """
     config = _pipeline_config(args)
     payload = _config_payload(args, config, cache, targets)
     config_path = report_dir / "score_config.json"
@@ -257,15 +277,22 @@ def _score_or_load(
         for method in METHODS
     }
 
+    # Only compact vectors are retained for the later cross-layer optimizer.
+    # The large [samples, units, bands] tensors inside LayerAblationScores are
+    # released immediately after per-layer diagnostics are written.
+    compact: Dict[str, Dict[int, Dict[str, np.ndarray]]] = {
+        unit_type: {} for unit_type in targets
+    }
+
     coverage_targets = (
         config.budget.coverage_ratios
         if config.budget.coverage_ratios is not None
         else tuple([config.budget.coverage_ratio] * config.frequency.target_bands)
     )
     print(
-        f"[paper selection] strategy={args.paper_final_keep_strategy}, "
-        f"bands={config.frequency.target_bands}, coverage_targets={coverage_targets}, "
-        f"band_selection_weights={config.budget.band_selection_weights}",
+        f"[paper ablation] MI=score-only, GB=score-only, LCB=score-only, "
+        f"Full={args.paper_final_keep_strategy}; global_budget={args.paper_global_budget}; "
+        f"bands={config.frequency.target_bands}, coverage_targets={coverage_targets}",
         flush=True,
     )
 
@@ -282,65 +309,37 @@ def _score_or_load(
                     layer_id=layer_id * len(targets) + target_offset,
                     base_sample_ids=cache.base_sample_ids,
                 )
-                ratio, exact_count = _target_budget(args, unit_type)
-                prune_count = resolve_prune_count(
-                    scores.mi_score.size,
-                    ratio,
-                    exact_count,
-                )
-                layer_score_vectors = {
-                    "paper_mi": np.asarray(scores.mi_score, dtype=np.float64),
-                    "paper_mi_gb": np.asarray(scores.granular_score, dtype=np.float64),
-                    "paper_mi_gb_lcb": np.asarray(scores.lcb_score, dtype=np.float64),
+                compact[unit_type][layer_id] = {
+                    "mi_score": np.asarray(scores.mi_score, dtype=np.float64).copy(),
+                    "gb_score": np.asarray(scores.granular_score, dtype=np.float64).copy(),
+                    "lcb_score": np.asarray(scores.lcb_score, dtype=np.float64).copy(),
+                    "mi_bands": np.asarray(scores.global_spectrum.band_mi, dtype=np.float64).copy(),
+                    "gb_bands": np.asarray(scores.granular_band_mi, dtype=np.float64).copy(),
+                    "lcb_bands": np.asarray(scores.lcb_band_mean, dtype=np.float64).copy(),
                 }
-                layer_band_vectors = {
-                    "paper_mi": np.asarray(scores.global_spectrum.band_mi, dtype=np.float64),
-                    "paper_mi_gb": np.asarray(scores.granular_band_mi, dtype=np.float64),
-                    "paper_mi_gb_lcb": np.asarray(
-                        scores.lcb_band_mean, dtype=np.float64
-                    ),
-                }
-                keep_count = scores.mi_score.size - prune_count
-                layer_selections = {}
-                coverage_text = []
-                for method in METHODS:
-                    keep, priority, achieved = select_keep_indices(
-                        args.paper_final_keep_strategy,
-                        layer_score_vectors[method],
-                        layer_band_vectors[method],
-                        keep_count,
-                        config.budget,
-                    )
-                    prune = np.setdiff1d(
-                        np.arange(scores.mi_score.size, dtype=np.int64), keep,
-                        assume_unique=True,
-                    )
-                    layer_selections[method] = prune
-                    unit_scores[method][unit_type][layer_id] = priority.astype(np.float32)
-                    coverage_text.append(
-                        f"{method.split('paper_')[-1]}="
-                        + "/".join(f"{value:.2f}" for value in achieved)
-                    )
-                for method, indices in layer_selections.items():
-                    selections[method][unit_type][layer_id] = indices
-                writer.add_layer(layer_id, unit_type, scores, layer_selections)
 
+                # Cross-layer masks are not known yet.  Keep the contribution
+                # report truthful by leaving prune flags blank; final flags are
+                # written after global selection to global_selection_status.csv.
+                writer.add_layer(layer_id, unit_type, scores, {})
+
+                ratio, exact_count = _target_budget(args, unit_type)
+                nominal_prune = resolve_prune_count(scores.mi_score.size, ratio, exact_count)
                 ball_counts = [len(item.balls) for item in scores.granularities]
+                fusion = [float(item.fusion_weight) for item in scores.granularities]
                 print(
-                    f"  {unit_type}: units={scores.mi_score.size}, prune={prune_count}, "
-                    f"ratio={prune_count / scores.mi_score.size:.4f}, "
-                    f"balls={ball_counts}, lcb_std_mean={scores.lcb_std.mean():.6g}, "
-                    f"coverage=[{'; '.join(coverage_text)}]"
+                    f"  {unit_type}: units={scores.mi_score.size}, nominal_prune={nominal_prune}, "
+                    f"balls={ball_counts}, fusion={[round(v, 4) for v in fusion]}, "
+                    f"lcb_std_mean={scores.lcb_std.mean():.6g}"
                 )
                 if len(set(ball_counts)) == 1:
                     print(
-                        "  WARNING: purity thresholds produced identical ball counts; "
-                        "consider lowering min_ball_size or min_event_classes."
+                        "  NOTE: purity thresholds produced identical ball counts; "
+                        "the fusion can still differ by local MI, but inspect the ball report."
                     )
-                if np.allclose(scores.lcb_std, 0.0):
+                if config.lcb.repeats > 1 and np.allclose(scores.lcb_std, 0.0):
                     print(
-                        "  WARNING: all LCB standard deviations are zero; "
-                        "check repeat count and scenario/event diversity."
+                        "  WARNING: repeated LCB still has zero variance; inspect bootstrap diversity."
                     )
                 if layer_id in plot_layers:
                     plot_granular_balls(
@@ -354,7 +353,7 @@ def _score_or_load(
                         order = np.argsort(scores.lcb_score, kind="stable")
                         representative = {
                             "low": int(order[0]),
-                            "boundary": int(order[min(prune_count, order.size - 1)]),
+                            "boundary": int(order[min(nominal_prune, order.size - 1)]),
                             "high": int(order[-1]),
                         }
                         for label, unit_id in representative.items():
@@ -376,9 +375,129 @@ def _score_or_load(
     finally:
         writer.close()
 
+    method_score_key = {
+        "paper_mi": "mi_score",
+        "paper_mi_gb": "gb_score",
+        "paper_mi_gb_lcb": "lcb_score",
+        "paper_full": "lcb_score",
+    }
+    method_band_key = {
+        "paper_mi": "mi_bands",
+        "paper_mi_gb": "gb_bands",
+        "paper_mi_gb_lcb": "lcb_bands",
+        "paper_full": "lcb_bands",
+    }
+    budget_summary = {
+        "global_budget": bool(args.paper_global_budget),
+        "global_layer_spread": float(args.paper_global_layer_spread),
+        "ablation": {
+            "paper_mi": "MI scalar score only",
+            "paper_mi_gb": "multi-granularity local-MI scalar score only",
+            "paper_mi_gb_lcb": "bootstrap LCB scalar score only",
+            "paper_full": f"LCB + {args.paper_final_keep_strategy}",
+        },
+        "unit_types": {},
+    }
+
+    for unit_type in targets:
+        layer_ids = sorted(compact[unit_type])
+        ratio, exact_count = _target_budget(args, unit_type)
+        nominal_prune = {
+            layer_id: resolve_prune_count(
+                compact[unit_type][layer_id]["mi_score"].size, ratio, exact_count
+            )
+            for layer_id in layer_ids
+        }
+
+        if args.paper_global_budget:
+            sizes = [compact[unit_type][layer_id]["mi_score"].size for layer_id in layer_ids]
+            offsets = np.cumsum([0] + sizes)
+            total_units = int(offsets[-1])
+            prune_total = int(sum(nominal_prune.values()))
+            keep_total = total_units - prune_total
+            all_indices = np.arange(total_units, dtype=np.int64)
+            type_summary = {
+                "total_units": total_units,
+                "prune_total": prune_total,
+                "keep_total": keep_total,
+                "nominal_per_layer_prune": {str(k): int(v) for k, v in nominal_prune.items()},
+                "methods": {},
+            }
+
+            for method in METHODS:
+                score_vector = np.concatenate([
+                    compact[unit_type][layer_id][method_score_key[method]]
+                    for layer_id in layer_ids
+                ])
+                band_vector = np.concatenate([
+                    compact[unit_type][layer_id][method_band_key[method]]
+                    for layer_id in layer_ids
+                ], axis=0)
+                strategy = args.paper_final_keep_strategy if method == "paper_full" else "lcb_only"
+                keep, priority, achieved = select_keep_indices(
+                    strategy,
+                    score_vector,
+                    band_vector,
+                    keep_total,
+                    config.budget,
+                )
+                prune_global = np.setdiff1d(all_indices, keep, assume_unique=True)
+                per_layer_counts = {}
+                for position, layer_id in enumerate(layer_ids):
+                    start, end = int(offsets[position]), int(offsets[position + 1])
+                    local_prune = prune_global[(prune_global >= start) & (prune_global < end)] - start
+                    selections[method][unit_type][layer_id] = local_prune.astype(np.int64)
+                    unit_scores[method][unit_type][layer_id] = priority[start:end].astype(np.float32)
+                    per_layer_counts[str(layer_id)] = int(local_prune.size)
+                type_summary["methods"][method] = {
+                    "strategy": strategy,
+                    "achieved_band_coverage": [float(v) for v in achieved],
+                    "per_layer_prune": per_layer_counts,
+                }
+                print(
+                    f"[global budget] {unit_type} {method}: prune={prune_total}/{total_units}, "
+                    f"layer_prune_range={min(per_layer_counts.values())}-{max(per_layer_counts.values())}, "
+                    f"coverage={'/'.join(f'{v:.3f}' for v in achieved)}",
+                    flush=True,
+                )
+            budget_summary["unit_types"][unit_type] = type_summary
+        else:
+            type_summary = {"methods": {}, "nominal_per_layer_prune": {str(k): int(v) for k, v in nominal_prune.items()}}
+            for method in METHODS:
+                strategy = args.paper_final_keep_strategy if method == "paper_full" else "lcb_only"
+                method_coverage = {}
+                for layer_id in layer_ids:
+                    block = compact[unit_type][layer_id]
+                    unit_count = block["mi_score"].size
+                    keep_count = unit_count - nominal_prune[layer_id]
+                    keep, priority, achieved = select_keep_indices(
+                        strategy,
+                        block[method_score_key[method]],
+                        block[method_band_key[method]],
+                        keep_count,
+                        config.budget,
+                    )
+                    selections[method][unit_type][layer_id] = np.setdiff1d(
+                        np.arange(unit_count, dtype=np.int64), keep, assume_unique=True
+                    )
+                    unit_scores[method][unit_type][layer_id] = priority.astype(np.float32)
+                    method_coverage[str(layer_id)] = [float(v) for v in achieved]
+                type_summary["methods"][method] = {
+                    "strategy": strategy,
+                    "achieved_band_coverage_by_layer": method_coverage,
+                }
+            budget_summary["unit_types"][unit_type] = type_summary
+
     write_selection_files(report_dir, selections, args.paper_prune_step)
+    status_path = write_global_selection_status(
+        report_dir, selections, {unit_type: cache.unit_counts[unit_type] for unit_type in targets}
+    )
     _save_unit_scores(unit_scores_path, unit_scores)
+    (report_dir / "global_budget_summary.json").write_text(
+        json.dumps(budget_summary, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     config_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"saved final selection flags: {status_path}")
     return selections, unit_scores
 
 
@@ -396,7 +515,8 @@ def _print_mask_overlap(
     pairs = [
         ("paper_mi", "paper_mi_gb"),
         ("paper_mi_gb", "paper_mi_gb_lcb"),
-        ("paper_mi", "paper_mi_gb_lcb"),
+        ("paper_mi_gb_lcb", "paper_full"),
+        ("paper_mi", "paper_full"),
     ]
     for left, right in pairs:
         a, b = flatten(selections[left]), flatten(selections[right])
@@ -460,27 +580,127 @@ def _validate_cache_against_model(args, cache, model, targets: tuple[str, ...]) 
                     )
 
 
+def _derive_global_layer_weight_ratios(
+    model,
+    selected: Mapping[str, Mapping[int, np.ndarray]],
+    targets: tuple[str, ...],
+    mlp_ratio: float,
+    attention_ratio: float,
+    spread: float,
+    unit_budget: bool = False,
+    min_unit_sparsity: float = 0.30,
+    max_unit_sparsity: float = 0.70,
+) -> Dict[str, Dict[int, float]]:
+    """Map global structural allocation to bounded layer-wise weight budgets.
+
+    The raw signal is each layer's fraction of globally-pruned structural units.
+    We center that signal using parameter-count weights and scale it around the
+    requested global weight sparsity.  The weighted mean therefore remains the
+    original target, while layer ratios can move by at most ``spread``.
+    """
+    layers = getattr(getattr(model, "model", model), "layers")
+    result: Dict[str, Dict[int, float]] = {}
+    eps = 1e-4
+    for unit_type in targets:
+        base_ratio = float(attention_ratio if unit_type == "attention" else mlp_ratio)
+        raw = []
+        parameter_weights = []
+        layer_ids = sorted(selected.get(unit_type, {}))
+        if not layer_ids:
+            continue
+        for layer_id in layer_ids:
+            layer = layers[layer_id]
+            if unit_type == "mlp":
+                unit_count = int(layer.mlp.down_proj.in_features)
+                parameter_count = sum(
+                    int(module.weight.numel())
+                    for module in (layer.mlp.gate_proj, layer.mlp.up_proj, layer.mlp.down_proj)
+                )
+            else:
+                attn = layer.self_attn
+                unit_count = int(
+                    getattr(attn, "num_heads", 0)
+                    or getattr(model.config, "num_attention_heads", 0)
+                )
+                parameter_count = sum(
+                    int(module.weight.numel())
+                    for module in (attn.q_proj, attn.k_proj, attn.v_proj, attn.o_proj)
+                )
+            raw.append(len(selected[unit_type][layer_id]) / float(unit_count))
+            parameter_weights.append(float(parameter_count))
+
+        raw_arr = np.asarray(raw, dtype=np.float64)
+        weight_arr = np.asarray(parameter_weights, dtype=np.float64)
+        center = float(np.average(raw_arr, weights=weight_arr))
+        dev = raw_arr - center
+
+        low = max(eps, base_ratio - float(spread))
+        high = min(1.0 - eps, base_ratio + float(spread))
+        if unit_budget:
+            low = max(low, float(min_unit_sparsity))
+            high = min(high, float(max_unit_sparsity))
+        if not low <= base_ratio <= high:
+            raise ValueError(
+                f"global layer budget bounds [{low:.4f},{high:.4f}] do not contain "
+                f"target {base_ratio:.4f} for {unit_type}"
+            )
+
+        scale = 1.0
+        positive = dev[dev > 0]
+        negative = dev[dev < 0]
+        if positive.size:
+            scale = min(scale, (high - base_ratio) / float(positive.max()))
+        if negative.size:
+            scale = min(scale, (base_ratio - low) / float(-negative.min()))
+        scale = max(0.0, min(1.0, scale))
+        ratios = base_ratio + scale * dev
+
+        # Floating-point correction keeps the parameter-weighted mean at the
+        # requested target without changing ordering or exceeding bounds.
+        correction = base_ratio - float(np.average(ratios, weights=weight_arr))
+        ratios = np.clip(ratios + correction, low, high)
+        result[unit_type] = {
+            int(layer_id): float(ratio)
+            for layer_id, ratio in zip(layer_ids, ratios)
+        }
+        weighted_mean = float(np.average(ratios, weights=weight_arr))
+        print(
+            f"[global weight budget] {unit_type}: target={base_ratio:.4f}, "
+            f"layer_range={ratios.min():.4f}-{ratios.max():.4f}, "
+            f"parameter_weighted_mean={weighted_mean:.6f}",
+            flush=True,
+        )
+    return result
+
+
 def _print_applied_budget(
     model,
     selected: Mapping[str, Mapping[int, np.ndarray]],
 ) -> None:
     layers = getattr(getattr(model, "model", model), "layers")
     for unit_type, layer_map in selected.items():
-        first_layer = min(layer_map) if layer_map else None
-        if first_layer is None:
+        if not layer_map:
             continue
-        pruned = len(layer_map[first_layer])
-        if unit_type == "mlp":
-            total = int(layers[first_layer].mlp.down_proj.in_features)
-        else:
-            attn = layers[first_layer].self_attn
-            total = int(
-                getattr(attn, "num_heads", 0)
-                or getattr(model.config, "num_attention_heads", 0)
-            )
+        prune_counts = []
+        total_units = 0
+        total_pruned = 0
+        for layer_id, indices in sorted(layer_map.items()):
+            if unit_type == "mlp":
+                count = int(layers[layer_id].mlp.down_proj.in_features)
+            else:
+                attn = layers[layer_id].self_attn
+                count = int(
+                    getattr(attn, "num_heads", 0)
+                    or getattr(model.config, "num_attention_heads", 0)
+                )
+            pruned = int(len(indices))
+            prune_counts.append(pruned)
+            total_units += count
+            total_pruned += pruned
         print(
-            f"applied {unit_type} structured sparsity: "
-            f"{pruned}/{total} = {pruned / total:.6f} per layer"
+            f"applied {unit_type} structured sparsity: {total_pruned}/{total_units} "
+            f"= {total_pruned / total_units:.6f} globally; "
+            f"per-layer prune range={min(prune_counts)}-{max(prune_counts)}"
         )
 
 
@@ -530,6 +750,27 @@ def prune_paper(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
     mlp_ratio, _ = _target_budget(args, "mlp")
     attention_ratio, _ = _target_budget(args, "attention")
     unit_budget = args.paper_mask_style == "unit_budget_weight"
+    layer_ratios = None
+    if args.paper_global_budget:
+        layer_ratios = _derive_global_layer_weight_ratios(
+            model,
+            selected,
+            targets,
+            mlp_ratio=mlp_ratio,
+            attention_ratio=attention_ratio,
+            spread=args.paper_global_layer_spread,
+            unit_budget=unit_budget,
+            min_unit_sparsity=args.paper_unit_min_sparsity,
+            max_unit_sparsity=args.paper_unit_max_sparsity,
+        )
+        (report_dir / f"weight_layer_budget_{method}.json").write_text(
+            json.dumps(
+                {unit_type: {str(k): v for k, v in layer_map.items()}
+                 for unit_type, layer_map in layer_ratios.items()},
+                ensure_ascii=False, indent=2,
+            ),
+            encoding="utf-8",
+        )
     if unit_budget:
         print(
             f"applying {method} score-driven unit-budget weight masks; "
@@ -562,6 +803,7 @@ def prune_paper(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
             unit_budget=unit_budget,
             min_unit_sparsity=args.paper_unit_min_sparsity,
             max_unit_sparsity=args.paper_unit_max_sparsity,
+            layer_ratios=layer_ratios,
         )
     elif unit_budget:
         summaries = apply_paper_unit_budget_weight_masks_(
@@ -574,6 +816,7 @@ def prune_paper(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
             min_unit_sparsity=args.paper_unit_min_sparsity,
             max_unit_sparsity=args.paper_unit_max_sparsity,
             chunk_rows=args.paper_wanda_chunk_rows,
+            layer_ratios=layer_ratios,
         )
     else:
         summaries = apply_paper_wanda_weight_masks_(
@@ -588,6 +831,7 @@ def prune_paper(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
             temperature=args.paper_wanda_temperature,
             guidance_strength=args.paper_wanda_guidance_strength,
             chunk_rows=args.paper_wanda_chunk_rows,
+            layer_ratios=layer_ratios,
         )
     summary_path = report_dir / f"weight_mask_summary_{method}.csv"
     write_weight_mask_summary(summary_path, summaries)

@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 
-METHODS = ("paper_mi", "paper_mi_gb", "paper_mi_gb_lcb")
+METHODS = ("paper_mi", "paper_mi_gb", "paper_mi_gb_lcb", "paper_full")
 
 
 def _stream_command(command, log_path: Path, env: dict) -> None:
@@ -33,7 +33,7 @@ def _stream_command(command, log_path: Path, env: dict) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run MI, MI+granular-ball and MI+granular-ball+LCB on fresh model copies."
+        description="Run clean MI -> GB -> LCB -> Full ablation on fresh model copies."
     )
     parser.add_argument("--model", required=True)
     parser.add_argument("--cache_dir", default="llm_weights")
@@ -115,8 +115,8 @@ def main() -> None:
     print(f"saved: {summary_path}")
     if len(set(round(value, 8) for value in ppls)) == 1:
         print("WARNING: all PPL values are still identical; inspect shared_score_report/mask_overlap.csv.")
-    if not (ppls[0] > ppls[1] > ppls[2]):
-        print("NOTE: PPL is not strictly descending. The code reports real measurements and does not force a curve.")
+    if not all(left > right for left, right in zip(ppls, ppls[1:])):
+        print("NOTE: PPL is not strictly descending. GB/LCB primarily target stability; the code reports real measurements and does not force a curve.")
 
 
 if __name__ == "__main__":

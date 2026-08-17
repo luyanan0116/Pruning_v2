@@ -73,23 +73,34 @@ def test_purity_thresholds_create_nested_ball_counts():
     assert all(0.0 <= ball.purity <= 1.0 for _, balls in hierarchy for ball in balls)
 
 
-def test_three_ablation_paths_and_lcb_variance():
+def test_three_ablation_paths_and_real_lcb_variance():
     x, events, scenarios = synthetic_responses(2)
+    base_ids = np.repeat(np.arange(24), 3)
     cfg = PipelineConfig(
         frequency=FrequencyConfig(fine_bins=8, target_bands=4, mi_neighbors=2, random_state=4),
         granular_ball=GranularBallConfig(
             purity_thresholds=(0.55, 0.65, 0.75),
             min_ball_size=6,
             max_balls=16,
-            min_event_classes=1,
+            min_event_classes=2,
+            min_event_count_per_class=2,
+            localization_mode="layer_shared",
+            kde_scope="none",
         ),
-        lcb=LCBConfig(repeats=1, sample_fraction=1.0, lcb_lambda=1.0, random_state=7),
+        lcb=LCBConfig(
+            repeats=5, sample_fraction=0.8, scenario_fraction=2 / 3,
+            lcb_lambda=0.5, random_state=7,
+        ),
     )
-    result = score_layer(x, events, scenarios, cfg, layer_id=3)
-    assert result.bootstrap_scores.shape == (1, 24)
-    assert np.all(result.lcb_std == 0)
+    result = score_layer(
+        x, events, scenarios, cfg, layer_id=3, base_sample_ids=base_ids
+    )
+    assert result.bootstrap_scores.shape == (5, 24)
+    assert np.any(result.lcb_std > 0)
     assert not np.allclose(result.mi_score, result.granular_score)
-    assert np.allclose(result.granular_score, result.lcb_score)
+    assert np.allclose(
+        result.lcb_score, result.lcb_mean - 0.5 * result.lcb_std
+    )
 
 
 class ToyMLP(torch.nn.Module):
@@ -576,3 +587,87 @@ def test_paper_hybrid_budget_remains_exact_with_three_bands():
     assert keep.size == 20
     assert priority.shape == (40,)
     assert achieved.shape == (3,)
+
+
+
+def test_invalid_ball_mass_is_renormalized():
+    from lib.paper_pruning.granular_ball import (
+        GranularBall, _BallMI, _aggregate_partition_from_cache, _ball_key
+    )
+
+    b0 = GranularBall(np.array([0, 1]), np.zeros(1), 1.0, 0.5, 0, 0)
+    b1 = GranularBall(np.array([2, 3]), np.zeros(1), 1.0, 1.0, 0, 0)
+    valid_knn = np.array([[2.0, 4.0], [1.0, 3.0]])
+    cache = {
+        _ball_key(b0): _BallMI(
+            knn=valid_knn, kde=valid_knn.copy(), total=np.array([3.0, 2.0]),
+            sample_weight=0.5, valid=True,
+        ),
+        _ball_key(b1): _BallMI(
+            knn=np.zeros((2, 2)), kde=np.zeros((2, 2)), total=np.zeros(2),
+            sample_weight=0.5, valid=False,
+        ),
+    }
+    knn, kde, _ = _aggregate_partition_from_cache([b0, b1], cache, 2, 2)
+    assert np.allclose(knn, valid_knn)
+    assert np.allclose(kde, valid_knn)
+
+
+def test_fusion_weights_remain_genuinely_multigranular():
+    from lib.paper_pruning.granular_ball import _fusion_weights
+
+    cfg = GranularBallConfig(
+        purity_thresholds=(0.6, 0.7, 0.8),
+        fusion_mode="inverse_sqrt_dispersion",
+        fusion_max_ratio=5.0,
+    )
+    weights = _fusion_weights([1e-12, 1e-3, 1e-2], cfg)
+    assert np.isclose(weights.sum(), 1.0)
+    assert weights.max() / weights.min() <= 5.0 + 1e-12
+    assert np.all(weights > 0)
+
+
+def test_coverage_greedy_always_keeps_scalar_term_active():
+    from lib.paper_pruning.budget import coverage_aware_keep_indices
+    from lib.paper_pruning.config import BudgetConfig
+
+    # Unit 0 has the best scalar score but no special coverage.  With a small
+    # alpha it must not be displaced merely because another unit serves a band.
+    scores = np.array([10.0, 0.0, -1.0, -2.0])
+    bands = np.array([
+        [0.1, 0.1],
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [0.2, 0.2],
+    ])
+    keep, _, _ = coverage_aware_keep_indices(
+        scores, bands, keep_count=2,
+        cfg=BudgetConfig(coverage_ratio=0.5, coverage_alpha=0.01, greedy_batches=2),
+    )
+    assert 0 in keep
+
+
+
+def test_nonsequential_wanda_accepts_cross_layer_ratio_budget():
+    model = ToyModel()
+    layer_ratios = {
+        "mlp": {0: 0.40, 1: 0.60},
+        "attention": {0: 0.45, 1: 0.55},
+    }
+    summaries = apply_paper_wanda_weight_masks_(
+        model,
+        _toy_scores(model),
+        FakeResponseCache(model),
+        targets=("mlp", "attention"),
+        mlp_ratio=0.5,
+        attention_ratio=0.5,
+        row_spread=0.0,
+        guidance_strength=0.0,
+        chunk_rows=2,
+        layer_ratios=layer_ratios,
+    )
+    for row in summaries:
+        expected = layer_ratios[
+            "attention" if row["module"].startswith("self_attn.") else "mlp"
+        ][row["layer"]]
+        assert np.isclose(row["target_ratio"], expected)
