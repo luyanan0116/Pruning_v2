@@ -13,7 +13,8 @@ from .paper_pruning.collector import UNIT_TYPES, collect_gradient_response_cache
 from .paper_pruning.config import BudgetConfig, FrequencyConfig, GranularBallConfig, LCBConfig, PipelineConfig
 from .paper_pruning.pipeline import score_layer
 from .paper_pruning.reporting import LayerReportWriter, plot_granular_balls, plot_lcb_scores, plot_unit_local_granular_balls
-from .paper_pruning.weight_budget import allocate_weight_budget, apply_weight_budget_, write_weight_budget
+from .paper_pruning.weight_budget import allocate_weight_budget, write_weight_budget
+from .paper_pruning.wanda_mask import sequential_wanda_prune_
 
 
 PAPER_METHODS = {"paper_mi", "paper_mi_gb", "paper_mi_gb_lcb", "paper_full"}
@@ -274,6 +275,20 @@ def prune_paper(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
         raise ValueError(f"unsupported paper method: {method}")
     targets = _parse_targets(args.paper_prune_targets)
 
+    # Uniform reference: skip all paper scoring and run the same sequential
+    # per-output Wanda mask used by the explicit --prune_method wanda baseline.
+    if args.paper_weight_allocation == "uniform":
+        dataloader, _ = get_loaders(
+            "c4", nsamples=args.wanda_nsamples, seed=args.seed,
+            seqlen=args.wanda_calib_seqlen or model.seqlen, tokenizer=tokenizer,
+        )
+        return sequential_wanda_prune_(
+            model, dataloader, nsamples=args.wanda_nsamples,
+            seqlen=args.wanda_calib_seqlen or model.seqlen,
+            sparsity=args.sparsity_ratio, budget=None,
+            storage_mode=args.wanda_activation_storage,
+        )
+
     cache_dir = Path(args.paper_cache_dir)
     if (cache_dir / "metadata.json").exists() and not args.paper_overwrite_cache:
         print(f"loading paper gradient-response cache from {cache_dir}")
@@ -314,6 +329,7 @@ def prune_paper(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
         allocation=args.paper_weight_allocation,
         min_unit_sparsity=args.paper_weight_min_unit_sparsity,
         max_unit_sparsity=args.paper_weight_max_unit_sparsity,
+        projection_temperature=args.paper_budget_temperature,
         coverage_ratio=args.paper_band_coverage_ratio,
         coverage_ratios=coverage_ratios,
         coverage_alpha=args.paper_coverage_alpha,
@@ -325,11 +341,17 @@ def prune_paper(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
         f"weights={budget.target_pruned_weights}/{budget.total_weights}",
         flush=True,
     )
-    summaries = apply_weight_budget_(
-        model,
-        budget,
-        seed=args.seed,
-        chunk_size=args.paper_weight_mask_chunk,
+    # Final element positions are selected by Wanda's activation-aware metric.
+    # The paper contribution score only determines the 45%-55% unit quota.
+    wanda_loader, _ = get_loaders(
+        "c4", nsamples=args.wanda_nsamples, seed=args.seed,
+        seqlen=args.wanda_calib_seqlen or model.seqlen, tokenizer=tokenizer,
+    )
+    summaries = sequential_wanda_prune_(
+        model, wanda_loader, nsamples=args.wanda_nsamples,
+        seqlen=args.wanda_calib_seqlen or model.seqlen,
+        sparsity=args.sparsity_ratio, budget=budget,
+        storage_mode=args.wanda_activation_storage,
     )
     budget_path = report_dir / f"weight_budget_{method}.csv"
     write_weight_budget(budget_path, budget, summaries)

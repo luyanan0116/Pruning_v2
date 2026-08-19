@@ -1,37 +1,152 @@
-# v8 Paper-only 50% Weight Pruning
+# V8.2 — Paper-guided 50% Weight Pruning + Wanda Element Mask
 
-This version implements the proposal pipeline without any external weight-pruning metric:
+This package is a **performance-oriented adaptation** of the V8 paper pipeline. It no longer claims that the final weight mask is purely paper-derived.
 
-1. task-loss gradient response for attention heads and FFN intermediate channels;
-2. per-sample standardization, DCT, fine frequency buckets, task-driven adjacent-band merging;
-3. frequency-band mutual-information contribution spectrum;
-4. granular-ball local MI and multi-granularity fusion;
-5. sample/scenario repeated estimation and LCB ranking;
-6. Full method: LCB + frequency under-coverage + parameter budget marginal gain;
-7. map paper-unit contribution to a global **weight** budget and set exactly 50% of the targeted transformer projection weights to zero.
+The paper-side contribution pipeline is retained:
 
-## Important adaptation
+1. task-loss gradient response;
+2. frequency decomposition and frequency-band MI contribution;
+3. granular-ball multi-granularity local MI;
+4. repeated sample/scenario estimation and LCB;
+5. optional frequency-coverage refinement for `paper_full`.
 
-The proposals formulate the final decision over complete heads/channels. This v8 intentionally does **not** delete complete heads or FFN channels. Instead, each paper unit receives a partial weight-pruning budget. The default bounds are 35%-65% sparsity per unit, so no scored unit is fully zeroed. Within each unit, exact zero positions are deterministic and uniformly distributed from a fixed seed. No weight magnitude, input-activation importance, Hessian, or other external weight score is used.
+The final pruning stage is redesigned for the user's hard constraint:
 
-For Llama-2-7B, the targeted weights are the seven transformer projections per block: q/k/v/o and gate/up/down. Embeddings, normalization parameters, biases, and the LM head are not part of the 50% target.
+- pruning object = **individual weights**, not complete heads/channels;
+- targeted transformer projections = q/k/v/o + gate/up/down;
+- global targeted-weight sparsity = **exactly 50%**;
+- every paper unit is constrained to **45%-55%** sparsity by default;
+- paper score decides the unit quota;
+- Wanda `|W| * sqrt(input-feature energy)` decides which elements are zeroed;
+- masking is sequential layer-by-layer: collect current-layer activations -> prune -> propagate sparse output to the next layer.
 
-## Reusing the v7 response cache
+## Why V8.2 changed V8
 
-A v7 `response_cache/` is compatible. v8 reads only gradient responses, event labels, sample/scenario identifiers and NLL information; any extra old files in that cache are ignored.
+V8 divided paper score by unit weight cost and then selected zero locations uniformly inside the chosen unit. For Llama-2-7B, an attention head owns far more weights than one FFN channel, so `score/cost` systematically suppresses attention-head utility. Uniform within-unit zeroing also ignores weight/activation importance.
 
-Example:
+V8.2 removes both behaviors:
+
+- **no `score / cost` ranking**;
+- **no deterministic-uniform mask in the main path**.
+
+A bounded constrained projection maps contribution score directly to a unit sparsity fraction. A scalar shift is solved by bisection so the weighted sum of all unit prune counts is exactly 50%.
+
+## Baseline first
+
+Use the same model, tokenizer and WikiText sequence length for Dense and Wanda:
 
 ```bash
-RESPONSE_CACHE_DIR=results/paper_v7_clean_s050/response_cache \
+MODEL_PATH=meta-llama/Llama-2-7b-hf \
+C4_PATH=/path/to/c4 \
+WIKITEXT2_PATH=/path/to/wikitext-2-raw \
+bash scripts/run_v82_dense_wanda_baseline.sh
+```
+
+The Wanda baseline uses:
+
+- C4 calibration;
+- `nsamples=128`;
+- `seed=0`;
+- `seqlen=4096`;
+- per-output-row 50% unstructured pruning;
+- tokenizer `use_fast=False`.
+
+## Four paper ablations + baselines
+
+```bash
+MODEL_PATH=meta-llama/Llama-2-7b-hf \
+C4_PATH=/path/to/c4 \
+WIKITEXT2_PATH=/path/to/wikitext-2-raw \
 bash scripts/run_v8_paper_only_weight50.sh
 ```
 
-## Four clean ablations
+This runs fresh model copies for:
 
-- `paper_mi`: frequency-domain MI only;
-- `paper_mi_gb`: MI + granular-ball multi-granularity local estimation;
-- `paper_mi_gb_lcb`: previous stage + repeated sample/scenario LCB;
-- `paper_full`: LCB + frequency coverage + global parameter budget.
+- `dense`
+- `wanda`
+- `paper_mi`
+- `paper_mi_gb`
+- `paper_mi_gb_lcb`
+- `paper_full`
 
-All four runs use fresh model copies and exactly 50% target projection-weight sparsity.
+Default tuning evaluation is **WikiText-2 validation**, not test. Use test only after parameters are fixed:
+
+```bash
+python run_paper_ablation.py ... --eval_wikitext_split both
+```
+
+## V8.2 defaults
+
+Paper statistics:
+
+```text
+paper_score_nsamples       128
+paper_calib_seqlen         1024
+paper_response_length      128
+paper_lcb_repeats          20
+paper_lcb_sample_fraction  0.80
+paper_lcb_scenario_fraction 2/3
+```
+
+Mask statistics / fair Wanda comparison:
+
+```text
+wanda_nsamples             128
+wanda_calib_seqlen         4096
+seqlen                     4096
+```
+
+Budget:
+
+```text
+paper_weight_min_unit_sparsity 0.45
+paper_weight_max_unit_sparsity 0.55
+paper_budget_temperature       1.0
+sparsity_ratio                 0.50
+```
+
+## Recommended tuning order
+
+Do not tune all MI/GB/LCB hyperparameters at once. First verify:
+
+1. Dense PPL is correct under the 4096 evaluation path.
+2. `wanda` is close to your standalone Wanda reproduction.
+3. `paper_mi` does not regress badly versus Wanda.
+4. Add GB, then LCB, then Full and compare **validation PPL**.
+
+If nonuniform allocation hurts, first weaken the quota contrast rather than changing MI:
+
+```text
+A. 0.475 - 0.525
+B. 0.45  - 0.55   (default)
+C. 0.425 - 0.575  only after A/B are stable
+```
+
+The target PPL around 6.5 is an experimental objective, **not a guaranteed outcome**. The code is designed to remove the two most damaging V8 mechanisms and make the comparison with Wanda controlled and diagnosable.
+
+## GPU memory
+
+Official-style 128 x 4096 sequential calibration stores large hidden-state buffers. V8.2 supports:
+
+```bash
+--wanda_activation_storage auto   # default
+--wanda_activation_storage cuda
+--wanda_activation_storage cpu
+```
+
+`auto` uses CUDA only when sufficient free memory is detected; otherwise it stores calibration hidden states on CPU and transfers one sample at a time.
+
+## Tests
+
+```bash
+pytest -q
+```
+
+V8.2 includes tests for:
+
+- exact 50% budget;
+- 45%-55% per-unit quota bounds;
+- score direction changing quota;
+- no complete unit removal;
+- exact sequential Wanda 50% mask;
+- exact paper-unit quota after activation-aware masking.

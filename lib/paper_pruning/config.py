@@ -111,7 +111,7 @@ class LCBConfig:
 
     repeats: int = 10
     sample_fraction: float = 0.8
-    scenario_fraction: float = 0.67
+    scenario_fraction: float = 2 / 3
     lcb_lambda: float = 1.0
     stratify_by_scenario: bool = True
     cluster_by_base_sample: bool = True

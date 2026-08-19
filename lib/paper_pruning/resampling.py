@@ -55,7 +55,7 @@ def dual_source_bootstrap_indices(
     unique_base = np.unique(base)
     unique_scenarios = np.unique(scenario)
     sample_count = max(2, int(np.ceil(unique_base.size * sample_fraction)))
-    scenario_count = max(1, int(np.ceil(unique_scenarios.size * scenario_fraction)))
+    scenario_count = max(1, min(unique_scenarios.size, int(np.round(unique_scenarios.size * scenario_fraction))))
 
     lookup = {
         (int(b), int(s)): np.flatnonzero((base == b) & (scenario == s))

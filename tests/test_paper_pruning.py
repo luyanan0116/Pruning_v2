@@ -297,3 +297,80 @@ def test_full_coverage_budget_keeps_exact_global_target():
     assert budget.prune_counts.sum() * 2 == budget.total_weights
     assert np.min(budget.prune_counts / budget.costs) >= 0.30 - 1e-9
     assert np.max(budget.prune_counts / budget.costs) <= 0.70 + 1e-9
+
+
+def test_v82_sequential_wanda_uniform_is_exact_50():
+    from lib.paper_pruning.wanda_mask import sequential_wanda_prune_
+
+    model = TinyCausalLM()
+    model.config.hidden_size = 4
+    data = []
+    for offset in range(4):
+        ids = (torch.arange(12).unsqueeze(0) + offset) % 13
+        data.append((ids, ids.clone()))
+    sequential_wanda_prune_(
+        model, data, nsamples=4, seqlen=12, sparsity=0.5,
+        budget=None, storage_mode="cpu",
+    )
+    assert abs(check_transformer_weight_sparsity(model) - 0.5) < 1e-12
+
+
+def test_v82_paper_quota_plus_wanda_mask_is_exact_per_unit_and_global():
+    from lib.paper_pruning.wanda_mask import sequential_wanda_prune_
+
+    model = TinyCausalLM()
+    model.config.hidden_size = 4
+    budget = allocate_weight_budget(
+        model,
+        "paper_mi_gb_lcb",
+        _evidence(model),
+        ("mlp", "attention"),
+        target_sparsity=0.50,
+        allocation="paper_nonuniform",
+        min_unit_sparsity=0.45,
+        max_unit_sparsity=0.55,
+        projection_temperature=1.0,
+    )
+    data = []
+    for offset in range(4):
+        ids = (torch.arange(12).unsqueeze(0) + offset) % 13
+        data.append((ids, ids.clone()))
+    sequential_wanda_prune_(
+        model, data, nsamples=4, seqlen=12, sparsity=0.5,
+        budget=budget, storage_mode="cpu",
+    )
+    assert abs(check_transformer_weight_sparsity(model) - 0.5) < 1e-12
+    for key, requested, cost in zip(budget.keys, budget.prune_counts, budget.costs):
+        actual_zero = int(cost) - _unit_nonzero_count(model, key)
+        assert actual_zero == int(requested)
+        assert 0.45 - 1 / int(cost) <= actual_zero / int(cost) <= 0.55 + 1 / int(cost)
+
+
+def test_v82_equal_scores_do_not_penalize_large_attention_units_by_cost():
+    model = TinyCausalLM()
+    evidence = _evidence(model)
+    for unit_type in evidence:
+        for payload in evidence[unit_type].values():
+            payload["score"] = np.ones_like(payload["score"], dtype=np.float64)
+    budget = allocate_weight_budget(
+        model, "paper_mi", evidence, ("mlp", "attention"),
+        target_sparsity=0.50, allocation="paper_nonuniform",
+        min_unit_sparsity=0.25, max_unit_sparsity=0.75,
+    )
+    fractions = budget.prune_counts / budget.costs
+    assert np.allclose(fractions, 0.5)
+
+
+def test_v82_two_thirds_of_three_scenarios_draws_two_not_three():
+    from lib.paper_pruning.resampling import dual_source_bootstrap_indices
+
+    base = np.repeat(np.arange(6), 3)
+    scenarios = np.tile(np.arange(3), 6)
+    events = np.repeat(np.arange(6) % 2, 3)
+    rng = np.random.default_rng(123)
+    indices = dual_source_bootstrap_indices(
+        events, base, scenarios,
+        sample_fraction=1.0, scenario_fraction=0.67, rng=rng,
+    )
+    # 6 resampled base slots x round(3*0.67)=2 scenario slots.
+    assert indices.size == 12

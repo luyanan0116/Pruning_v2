@@ -221,115 +221,161 @@ def _coverage_targets(coverage_ratio: float, coverage_ratios: Sequence[float] | 
     return result
 
 
-def _allocate_keep_scalar(
-    scores: np.ndarray,
+def _robust_zscore(values: np.ndarray) -> np.ndarray:
+    """Robustly normalize contribution scores without dividing by unit cost.
+
+    V8 used score/cost, which strongly penalized attention heads because a head
+    owns far more weights than one FFN channel. V8.2 maps score -> sparsity
+    directly and lets the global weighted projection enforce the exact budget.
+    """
+    x = _finite_scores(values)
+    median = float(np.median(x))
+    mad = float(np.median(np.abs(x - median)))
+    scale = 1.4826 * mad
+    if not np.isfinite(scale) or scale < 1e-12:
+        scale = float(np.std(x))
+    if not np.isfinite(scale) or scale < 1e-12:
+        return np.zeros_like(x)
+    return np.clip((x - median) / scale, -6.0, 6.0)
+
+
+def _integerize_exact(
+    raw_prune: np.ndarray,
     costs: np.ndarray,
-    min_keep: np.ndarray,
-    max_keep: np.ndarray,
-    target_keep: int,
+    min_prune: np.ndarray,
+    max_prune: np.ndarray,
+    target_pruned: int,
 ) -> np.ndarray:
-    keep = min_keep.copy()
-    remaining = int(target_keep - keep.sum())
-    if remaining < 0 or target_keep > int(max_keep.sum()):
-        raise ValueError("target keep budget is incompatible with per-unit sparsity bounds")
-    utility = _finite_scores(scores) / np.maximum(costs.astype(np.float64), 1.0)
-    order = np.lexsort((np.arange(scores.size), -utility))
-    for idx in order:
-        if remaining <= 0:
-            break
-        capacity = int(max_keep[idx] - keep[idx])
-        if capacity <= 0:
-            continue
-        take = min(capacity, remaining)
-        keep[idx] += take
-        remaining -= take
-    if remaining:
-        raise RuntimeError("failed to exhaust keep budget")
-    return keep
+    raw_counts = raw_prune * costs.astype(np.float64)
+    counts = np.floor(raw_counts).astype(np.int64)
+    counts = np.maximum(counts, min_prune)
+    counts = np.minimum(counts, max_prune)
+    residual = int(target_pruned - counts.sum())
+    frac = raw_counts - np.floor(raw_counts)
+    if residual > 0:
+        eligible = np.flatnonzero(counts < max_prune)
+        order = eligible[np.lexsort((eligible, -frac[eligible]))]
+        if residual > order.size:
+            # This should only happen if clipping created a larger integer gap.
+            for idx in order:
+                if residual <= 0:
+                    break
+                take = min(int(max_prune[idx] - counts[idx]), residual)
+                counts[idx] += take
+                residual -= take
+        else:
+            counts[order[:residual]] += 1
+            residual = 0
+    elif residual < 0:
+        need = -residual
+        eligible = np.flatnonzero(counts > min_prune)
+        order = eligible[np.lexsort((eligible, frac[eligible]))]
+        if need > order.size:
+            for idx in order:
+                if need <= 0:
+                    break
+                take = min(int(counts[idx] - min_prune[idx]), need)
+                counts[idx] -= take
+                need -= take
+        else:
+            counts[order[:need]] -= 1
+            need = 0
+        residual = -need
+    if residual != 0:
+        raise RuntimeError("unable to integerize projected sparsity to exact global target")
+    return counts
 
 
-def _allocate_keep_full(
+def _project_from_effective_score(
+    effective_score: np.ndarray,
+    costs: np.ndarray,
+    target_sparsity: float,
+    min_sparsity: float,
+    max_sparsity: float,
+    temperature: float,
+) -> np.ndarray:
+    """Constrained score-to-sparsity projection with exact weighted 50% target.
+
+    Higher contribution -> lower sparsity. A scalar shift is solved by bisection
+    so sum_i cost_i * sparsity_i equals the requested global weight budget while
+    every unit remains inside [min_sparsity, max_sparsity].
+    """
+    if temperature <= 0:
+        raise ValueError("projection temperature must be positive")
+    costs_f = costs.astype(np.float64)
+    target_pruned = int(round(float(costs.sum()) * float(target_sparsity)))
+    min_prune, max_prune = _bounds(costs, min_sparsity, max_sparsity)
+    if target_pruned < int(min_prune.sum()) or target_pruned > int(max_prune.sum()):
+        raise ValueError("global sparsity target is incompatible with per-unit bounds")
+
+    z = np.asarray(effective_score, dtype=np.float64)
+    half_span = min(float(target_sparsity - min_sparsity), float(max_sparsity - target_sparsity))
+    base = float(target_sparsity) - half_span * np.tanh(z / float(temperature))
+
+    def weighted(shift: float) -> tuple[float, np.ndarray]:
+        frac = np.clip(base + shift, min_sparsity, max_sparsity)
+        return float(np.dot(frac, costs_f)), frac
+
+    lo, hi = -1.0, 1.0
+    target_f = float(target_pruned)
+    for _ in range(80):
+        mid = 0.5 * (lo + hi)
+        value, _ = weighted(mid)
+        if value < target_f:
+            lo = mid
+        else:
+            hi = mid
+    _, frac = weighted(0.5 * (lo + hi))
+    return _integerize_exact(frac, costs, min_prune, max_prune, target_pruned)
+
+
+def _allocate_prune_projected(
     scores: np.ndarray,
     bands: np.ndarray,
     costs: np.ndarray,
-    min_keep: np.ndarray,
-    max_keep: np.ndarray,
-    target_keep: int,
+    target_sparsity: float,
+    min_sparsity: float,
+    max_sparsity: float,
+    temperature: float,
+    full: bool,
     coverage_ratio: float,
     coverage_ratios: Sequence[float] | None,
     coverage_alpha: float,
-    greedy_batches: int,
+    projection_iterations: int,
 ) -> np.ndarray:
-    keep = min_keep.copy()
-    remaining = int(target_keep - keep.sum())
-    if remaining < 0 or target_keep > int(max_keep.sum()):
-        raise ValueError("target keep budget is incompatible with per-unit sparsity bounds")
-    if remaining == 0:
-        return keep
-
-    normalized_bands = _normalized_bands(bands)
-    relative_bands = np.maximum(np.nan_to_num(bands, nan=0.0), 0.0)
-    relative_bands = relative_bands / np.maximum(relative_bands.max(axis=0, keepdims=True), 1e-12)
-    targets = _coverage_targets(coverage_ratio, coverage_ratios, bands.shape[1])
-    keep_fraction = keep.astype(np.float64) / costs.astype(np.float64)
-    current_coverage = (normalized_bands * keep_fraction[:, None]).sum(axis=0)
-    base_utility = _finite_scores(scores) / np.maximum(costs.astype(np.float64), 1.0)
-    capacity = max_keep - keep
-
-    rounds = max(1, int(greedy_batches))
-    for round_id in range(rounds):
-        if remaining <= 0:
-            break
-        active = capacity > 0
-        if not np.any(active):
-            break
-        under = np.maximum(0.0, targets - current_coverage)
-        coverage_utility = (relative_bands @ under) / np.maximum(costs.astype(np.float64), 1.0)
-        marginal = base_utility + float(coverage_alpha) * coverage_utility
-        marginal[~active] = -np.inf
-
-        rounds_left = max(1, rounds - round_id)
-        batch = max(1, int(math.ceil(remaining / rounds_left)))
-        order = np.lexsort((np.arange(marginal.size), -marginal))
-        batch_left = min(batch, remaining)
-        for idx in order:
-            if batch_left <= 0:
-                break
-            cap = int(capacity[idx])
-            if cap <= 0:
-                continue
-            take = min(cap, batch_left)
-            old_fraction = keep[idx] / float(costs[idx])
-            keep[idx] += take
-            capacity[idx] -= take
-            new_fraction = keep[idx] / float(costs[idx])
-            current_coverage += normalized_bands[idx] * (new_fraction - old_fraction)
-            batch_left -= take
-            remaining -= take
-
-    if remaining > 0:
-        # Finish exactly using the final paper marginal gain, preserving the
-        # same objective while avoiding a one-weight-at-a-time loop.
-        active = capacity > 0
-        under = np.maximum(0.0, targets - current_coverage)
-        marginal = base_utility + float(coverage_alpha) * (
-            (relative_bands @ under) / np.maximum(costs.astype(np.float64), 1.0)
+    base_z = _robust_zscore(scores)
+    effective = base_z.copy()
+    if not full or coverage_alpha <= 0:
+        return _project_from_effective_score(
+            effective, costs, target_sparsity, min_sparsity, max_sparsity, temperature
         )
-        marginal[~active] = -np.inf
-        order = np.lexsort((np.arange(marginal.size), -marginal))
-        for idx in order:
-            if remaining <= 0:
-                break
-            cap = int(capacity[idx])
-            if cap <= 0:
-                continue
-            take = min(cap, remaining)
-            keep[idx] += take
-            remaining -= take
-    if remaining:
-        raise RuntimeError("failed to exhaust Full keep budget")
-    return keep
 
+    positive = np.maximum(np.nan_to_num(bands, nan=0.0), 0.0)
+    per_band_share = positive / np.maximum(positive.sum(axis=0, keepdims=True), 1e-12)
+    relative = positive / np.maximum(positive.max(axis=0, keepdims=True), 1e-12)
+    ratios = _coverage_targets(coverage_ratio, coverage_ratios, bands.shape[1])
+    # In the original structured objective, 0.90 means retaining 90% of band
+    # coverage. Under partial weight quotas (45%-55%), absolute 0.90 is
+    # impossible. V8.2 therefore maps the ratio onto the feasible keep-fraction
+    # headroom: 0.50 + 0.90*(0.55-0.50) = 0.545 by default.
+    target_keep = 1.0 - float(target_sparsity)
+    max_keep = 1.0 - float(min_sparsity)
+    desired = target_keep + ratios * max(0.0, max_keep - target_keep)
+
+    counts = None
+    for _ in range(max(1, int(projection_iterations))):
+        counts = _project_from_effective_score(
+            effective, costs, target_sparsity, min_sparsity, max_sparsity, temperature
+        )
+        keep_fraction = 1.0 - counts.astype(np.float64) / costs.astype(np.float64)
+        coverage = (per_band_share * keep_fraction[:, None]).sum(axis=0)
+        under = np.maximum(0.0, desired - coverage)
+        if float(np.max(under)) < 1e-7:
+            break
+        bonus = relative @ under
+        effective = base_z + float(coverage_alpha) * _robust_zscore(bonus)
+    assert counts is not None
+    return counts
 
 def allocate_weight_budget(
     model: torch.nn.Module,
@@ -338,12 +384,13 @@ def allocate_weight_budget(
     targets: Sequence[str],
     target_sparsity: float = 0.50,
     allocation: str = "paper_nonuniform",
-    min_unit_sparsity: float = 0.35,
-    max_unit_sparsity: float = 0.65,
+    min_unit_sparsity: float = 0.45,
+    max_unit_sparsity: float = 0.55,
+    projection_temperature: float = 1.0,
     coverage_ratio: float = 0.90,
     coverage_ratios: Sequence[float] | None = None,
     coverage_alpha: float = 0.10,
-    greedy_batches: int = 64,
+    greedy_batches: int = 8,
 ) -> WeightBudget:
     if not 0 < target_sparsity < 1:
         raise ValueError("target_sparsity must be in (0,1)")
@@ -354,31 +401,20 @@ def allocate_weight_budget(
     if allocation == "uniform":
         prune = _exact_uniform_counts(costs, target_pruned)
     elif allocation == "paper_nonuniform":
-        min_prune, max_prune = _bounds(costs, min_unit_sparsity, max_unit_sparsity)
-        if target_pruned < int(min_prune.sum()) or target_pruned > int(max_prune.sum()):
-            raise ValueError(
-                "global target sparsity lies outside aggregate per-unit bounds; "
-                "widen --paper_weight_min_unit_sparsity/--paper_weight_max_unit_sparsity"
-            )
-        min_keep = costs - max_prune
-        max_keep = costs - min_prune
-        target_keep = total_weights - target_pruned
-        if method == "paper_full":
-            keep = _allocate_keep_full(
-                scores,
-                bands,
-                costs,
-                min_keep,
-                max_keep,
-                target_keep,
-                coverage_ratio,
-                coverage_ratios,
-                coverage_alpha,
-                greedy_batches,
-            )
-        else:
-            keep = _allocate_keep_scalar(scores, costs, min_keep, max_keep, target_keep)
-        prune = costs - keep
+        prune = _allocate_prune_projected(
+            scores,
+            bands,
+            costs,
+            target_sparsity=float(target_sparsity),
+            min_sparsity=float(min_unit_sparsity),
+            max_sparsity=float(max_unit_sparsity),
+            temperature=float(projection_temperature),
+            full=(method == "paper_full"),
+            coverage_ratio=float(coverage_ratio),
+            coverage_ratios=coverage_ratios,
+            coverage_alpha=float(coverage_alpha),
+            projection_iterations=int(greedy_batches),
+        )
     else:
         raise ValueError("allocation must be 'uniform' or 'paper_nonuniform'")
 
@@ -511,11 +547,11 @@ def apply_weight_budget_(
     seed: int = 0,
     chunk_size: int = 262144,
 ) -> list[dict]:
-    """Apply the exact paper-derived weight budget without any extra weight score.
+    """LEGACY V8 compatibility helper; not used by the V8.2 pruning path.
 
-    The mask order is deterministic and uniform inside every paper unit.  The
-    implementation is vectorized over FFN channels and attention heads so a
-    7B model does not require hundreds of thousands of Python-level unit loops.
+    V8.2 applies budgets through `wanda_mask.sequential_wanda_prune_`, which
+    uses activation-aware element metrics. This deterministic-uniform helper is
+    retained only so older scripts/tests importing it do not break.
     """
     del chunk_size  # retained as a stable CLI/API knob; vectorized kernels bound their own chunks.
     layers = _layers(model)
