@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
-MODEL_PATH="${MODEL_PATH:-meta-llama/Llama-2-7b-hf}"
-MODEL_CACHE_DIR="${MODEL_CACHE_DIR:-llm_weights}"
+MODEL_PATH="${MODEL_PATH:-/root/dw2/Lya/models/Llama-2-7b}"
+MODEL_CACHE_DIR="${MODEL_CACHE_DIR:-/root/dw2/Lya/models}"
 C4_PATH="${C4_PATH:-/root/dw2/Lya/dataset/dataset_c4}"
 WIKITEXT2_PATH="${WIKITEXT2_PATH:-/root/dw2/Lya/dataset/dataset_wikitext-raw}"
 OUTPUT_DIR="${OUTPUT_DIR:-results/v82_baseline}"
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TOKENIZERS_PARALLELISM=false
 mkdir -p "${OUTPUT_DIR}"
 
 python main.py --model "${MODEL_PATH}" --cache_dir "${MODEL_CACHE_DIR}" \

@@ -1,5 +1,6 @@
 import argparse
 import os
+from pathlib import Path
 from importlib.metadata import version
 
 import numpy as np
@@ -20,16 +21,71 @@ print("# of gpus:", torch.cuda.device_count())
 ALL_METHODS = {"dense", "wanda", *PAPER_METHODS}
 
 
-def get_llm(model_name: str, cache_dir: str = "llm_weights"):
+def _resolve_local_model_dir(model_path: str) -> str:
+    """Resolve and validate a *local* Transformers-format model directory.
+
+    V8.2-local intentionally never treats --model as a Hugging Face repo id.
+    This prevents accidental network access and makes experiments reproducible
+    on an offline server.
+    """
+    path = Path(model_path).expanduser().resolve()
+    if not path.is_dir():
+        raise FileNotFoundError(
+            f"Local model directory does not exist: {path}. "
+            "--model must point to a local Llama checkpoint directory, not a Hugging Face repo id."
+        )
+
+    config = path / "config.json"
+    if not config.is_file():
+        meta_original = (path / "params.json").is_file() and any(path.glob("consolidated.*.pth"))
+        if meta_original:
+            raise RuntimeError(
+                f"Detected an original Meta Llama checkpoint at {path} "
+                "(params.json + consolidated.*.pth), not a Transformers-format checkpoint. "
+                "This code requires the local model to be converted once to Hugging Face/Transformers format."
+            )
+        raise FileNotFoundError(f"Missing config.json in local model directory: {path}")
+
+    weight_files = (
+        list(path.glob("*.safetensors"))
+        + list(path.glob("pytorch_model*.bin"))
+        + list(path.glob("model*.bin"))
+    )
+    if not weight_files:
+        raise FileNotFoundError(
+            f"No local model weight files found in {path}; expected *.safetensors or pytorch_model*.bin."
+        )
+    return str(path)
+
+
+def get_llm(model_path: str, cache_dir: str | None = None):
+    # Force all Hugging Face/Transformers components into offline mode.
+    # from_pretrained is used only as the Transformers *local checkpoint reader*.
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+
+    local_dir = _resolve_local_model_dir(model_path)
+    print(f"[local-only] loading model files from: {local_dir}")
     model = AutoModelForCausalLM.from_pretrained(
-        model_name,
+        local_dir,
         torch_dtype=torch.float16,
-        cache_dir=cache_dir,
         low_cpu_mem_usage=True,
         device_map="auto",
+        local_files_only=True,
     )
     model.seqlen = model.config.max_position_embeddings
     return model
+
+
+def get_local_tokenizer(model_path: str):
+    local_dir = _resolve_local_model_dir(model_path)
+    print(f"[local-only] loading tokenizer files from: {local_dir}")
+    return AutoTokenizer.from_pretrained(
+        local_dir,
+        use_fast=False,
+        local_files_only=True,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -40,7 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
             "global transformer-projection sparsity is exactly 50%."
         )
     )
-    parser.add_argument("--model", required=True)
+    parser.add_argument("--model", required=True, help="LOCAL Transformers-format model directory; repo IDs are rejected")
     parser.add_argument("--cache_dir", default="llm_weights")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--seqlen", type=int, default=4096,
@@ -175,13 +231,13 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    print(f"loading llm model {args.model}")
+    print(f"loading LOCAL llm model {args.model}")
     model = get_llm(args.model, args.cache_dir)
     model.seqlen = min(int(args.seqlen), int(model.config.max_position_embeddings))
     if args.wanda_calib_seqlen > int(model.config.max_position_embeddings):
         parser.error("--wanda_calib_seqlen exceeds model max_position_embeddings")
     model.eval()
-    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
+    tokenizer = get_local_tokenizer(args.model)
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print("use device", device)

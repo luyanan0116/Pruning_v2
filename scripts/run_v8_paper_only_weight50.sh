@@ -1,12 +1,59 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODEL_PATH="${MODEL_PATH:-meta-llama/Llama-2-7b-hf}"
-MODEL_CACHE_DIR="${MODEL_CACHE_DIR:-llm_weights}"
+# Always run from the project root, even if this script is launched elsewhere.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${PROJECT_ROOT}"
+
+# -----------------------------------------------------------------------------
+# Local defaults for this server.
+# You can still override any of them from the command line, e.g.
+# MODEL_PATH=/other/model OUTPUT_DIR=results/test bash scripts/run_v8_paper_only_weight50.sh
+# -----------------------------------------------------------------------------
+MODEL_PATH="${MODEL_PATH:-/root/dw2/Lya/models/Llama-2-7b}"
+# This is only the Hugging Face cache directory. Because MODEL_PATH is a local
+# model directory, it does NOT need to point to the model itself.
+MODEL_CACHE_DIR="${MODEL_CACHE_DIR:-/root/dw2/Lya/models}"  # compatibility only; model is loaded directly from MODEL_PATH
 C4_PATH="${C4_PATH:-/root/dw2/Lya/dataset/dataset_c4}"
 WIKITEXT2_PATH="${WIKITEXT2_PATH:-/root/dw2/Lya/dataset/dataset_wikitext-raw}"
-OUTPUT_DIR="${OUTPUT_DIR:-results/paper_v82_weight50}"
+OUTPUT_DIR="${OUTPUT_DIR:-results/v82_main}"
 RESPONSE_CACHE_DIR="${RESPONSE_CACHE_DIR:-${OUTPUT_DIR}/response_cache}"
+
+# Hard offline mode: never contact Hugging Face Hub.
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TOKENIZERS_PARALLELISM=false
+
+# Fail early on path mistakes instead of spending GPU time before discovering them.
+for p in "${MODEL_PATH}" "${C4_PATH}" "${WIKITEXT2_PATH}"; do
+  if [[ ! -e "${p}" ]]; then
+    echo "[ERROR] Required path does not exist: ${p}" >&2
+    exit 1
+  fi
+done
+if [[ ! -f "${MODEL_PATH}/config.json" ]]; then
+  echo "[ERROR] ${MODEL_PATH}/config.json not found." >&2
+  echo "        MODEL_PATH must be a local Hugging Face/Transformers-format Llama directory." >&2
+  if [[ -f "${MODEL_PATH}/params.json" ]]; then
+    echo "        This looks like an original Meta checkpoint; convert it to Transformers format first." >&2
+  fi
+  exit 1
+fi
+if ! compgen -G "${MODEL_PATH}/*.safetensors" >/dev/null && \
+   ! compgen -G "${MODEL_PATH}/pytorch_model*.bin" >/dev/null && \
+   ! compgen -G "${MODEL_PATH}/model*.bin" >/dev/null; then
+  echo "[ERROR] No local .safetensors/.bin model weights found under ${MODEL_PATH}." >&2
+  exit 1
+fi
+mkdir -p "${MODEL_CACHE_DIR}" "${OUTPUT_DIR}" "${RESPONSE_CACHE_DIR}"
+
+echo "[V8.2] MODEL_PATH=${MODEL_PATH}"
+echo "[V8.2] MODEL_CACHE_DIR=${MODEL_CACHE_DIR}"
+echo "[V8.2] C4_PATH=${C4_PATH}"
+echo "[V8.2] WIKITEXT2_PATH=${WIKITEXT2_PATH}"
+echo "[V8.2] OUTPUT_DIR=${OUTPUT_DIR}"
 
 python run_paper_ablation.py \
   --model "${MODEL_PATH}" \

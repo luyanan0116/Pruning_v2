@@ -150,3 +150,14 @@ V8.2 includes tests for:
 - no complete unit removal;
 - exact sequential Wanda 50% mask;
 - exact paper-unit quota after activation-aware masking.
+
+
+## V8.2 local-only model loading
+
+This build intentionally rejects Hugging Face repository IDs. `--model` must point to a local
+Transformers-format checkpoint directory (for example `/root/dw2/Lya/models/Llama-2-7b`).
+The loader uses `local_files_only=True` and the run scripts export `HF_HUB_OFFLINE=1`,
+`TRANSFORMERS_OFFLINE=1`, and `HF_DATASETS_OFFLINE=1`. The local directory must contain
+`config.json`, tokenizer files, and `.safetensors` or `pytorch_model*.bin` weights. An original
+Meta checkpoint containing `params.json` + `consolidated.*.pth` must first be converted to
+Transformers format.
