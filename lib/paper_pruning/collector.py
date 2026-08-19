@@ -3,29 +3,22 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Mapping, Sequence
+from typing import Dict, List, Sequence
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
 
-CACHE_VERSION = 5
+CACHE_VERSION = 6
+COMPATIBLE_CACHE_VERSIONS = {5, 6}
 UNIT_TYPES = ("mlp", "attention")
-LINEAR_MODULES = (
-    "self_attn.q_proj",
-    "self_attn.k_proj",
-    "self_attn.v_proj",
-    "self_attn.o_proj",
-    "mlp.gate_proj",
-    "mlp.up_proj",
-    "mlp.down_proj",
-)
 
 
 @dataclass(frozen=True)
 class ResponseCache:
     root: Path
+    cache_version: int
     num_observations: int
     num_layers: int
     response_length: int
@@ -36,7 +29,6 @@ class ResponseCache:
     base_sample_ids: np.ndarray
     losses: np.ndarray
     position_losses: np.ndarray
-    linear_modules: tuple[str, ...]
 
     def layer_path(self, layer_id: int, unit_type: str = "mlp") -> Path:
         if unit_type not in UNIT_TYPES:
@@ -45,15 +37,6 @@ class ResponseCache:
 
     def load_layer(self, layer_id: int, unit_type: str = "mlp", mmap_mode: str = "r") -> np.ndarray:
         return np.load(self.layer_path(layer_id, unit_type), mmap_mode=mmap_mode)
-
-    def activation_scale_path(self, layer_id: int, module_name: str) -> Path:
-        if module_name not in self.linear_modules:
-            raise ValueError(f"unknown cached linear module: {module_name}")
-        safe_name = module_name.replace(".", "__")
-        return self.root / f"layer_{int(layer_id):03d}_{safe_name}_input_scale.npy"
-
-    def load_activation_scale(self, layer_id: int, module_name: str, mmap_mode: str = "r") -> np.ndarray:
-        return np.load(self.activation_scale_path(layer_id, module_name), mmap_mode=mmap_mode)
 
 
 def parse_scenario_ratios(raw: str | Sequence[float]) -> List[float]:
@@ -67,7 +50,7 @@ def parse_scenario_ratios(raw: str | Sequence[float]) -> List[float]:
 
 
 def _quantile_events(losses: np.ndarray, bins: int) -> np.ndarray:
-    """Build a unified task-event scale from position-derived NLL scores."""
+    """Build the unified task-event variable from next-token NLL."""
     if bins < 2:
         raise ValueError("event_bins must be >= 2")
     values = np.asarray(losses, dtype=np.float64)
@@ -94,8 +77,7 @@ def _transformer_layers(model: torch.nn.Module):
 
 
 def _input_device(model: torch.nn.Module) -> torch.device:
-    embedding = model.get_input_embeddings()
-    return embedding.weight.device
+    return model.get_input_embeddings().weight.device
 
 
 def _attention_layout(layer: torch.nn.Module, model: torch.nn.Module) -> Dict[str, int]:
@@ -103,11 +85,7 @@ def _attention_layout(layer: torch.nn.Module, model: torch.nn.Module) -> Dict[st
     if attn is None:
         raise AttributeError("transformer layer has no self_attn module")
     config = getattr(model, "config", None)
-    num_heads = int(
-        getattr(attn, "num_heads", 0)
-        or getattr(config, "num_attention_heads", 0)
-        or 0
-    )
+    num_heads = int(getattr(attn, "num_heads", 0) or getattr(config, "num_attention_heads", 0) or 0)
     num_kv_heads = int(
         getattr(attn, "num_key_value_heads", 0)
         or getattr(config, "num_key_value_heads", 0)
@@ -120,16 +98,11 @@ def _attention_layout(layer: torch.nn.Module, model: torch.nn.Module) -> Dict[st
             raise AttributeError("unable to infer attention head count")
         num_heads = q_out // head_dim
     if head_dim <= 0:
-        if q_out % num_heads != 0:
+        if q_out % num_heads:
             raise ValueError("q_proj output dimension is not divisible by num_heads")
         head_dim = q_out // num_heads
     if num_kv_heads <= 0:
         num_kv_heads = num_heads
-    if q_out != num_heads * head_dim:
-        raise ValueError(
-            f"attention layout mismatch: q_proj.out_features={q_out}, "
-            f"num_heads={num_heads}, head_dim={head_dim}"
-        )
     return {
         "num_heads": num_heads,
         "num_key_value_heads": num_kv_heads,
@@ -144,20 +117,14 @@ def load_response_cache(cache_dir: str | Path) -> ResponseCache:
         raise FileNotFoundError(metadata_path)
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     version = int(metadata.get("cache_version", 1))
-    if version != CACHE_VERSION:
+    if version not in COMPATIBLE_CACHE_VERSIONS:
         raise ValueError(
-            f"response cache version {version} is incompatible with the MLP+attention "
-            f"collector (expected {CACHE_VERSION}). Re-run with --paper_overwrite_cache."
+            f"response cache version {version} is incompatible; expected one of "
+            f"{sorted(COMPATIBLE_CACHE_VERSIONS)}. Rebuild the response cache."
         )
-    events = np.load(root / "events.npy")
-    scenarios = np.load(root / "scenario_ids.npy")
-    base_sample_ids = np.load(root / "base_sample_ids.npy")
-    losses = np.load(root / "losses.npy")
-    position_losses = np.load(root / "position_losses.npy")
-    raw_counts = metadata["unit_counts"]
     unit_counts = {
         unit_type: {int(key): int(value) for key, value in layer_map.items()}
-        for unit_type, layer_map in raw_counts.items()
+        for unit_type, layer_map in metadata["unit_counts"].items()
     }
     attention_layouts = {
         int(key): {name: int(value) for name, value in layout.items()}
@@ -165,26 +132,29 @@ def load_response_cache(cache_dir: str | Path) -> ResponseCache:
     }
     cache = ResponseCache(
         root=root,
+        cache_version=version,
         num_observations=int(metadata["num_observations"]),
         num_layers=int(metadata["num_layers"]),
         response_length=int(metadata["response_length"]),
         unit_counts=unit_counts,
         attention_layouts=attention_layouts,
-        events=events,
-        scenario_ids=scenarios,
-        base_sample_ids=base_sample_ids,
-        losses=losses,
-        position_losses=position_losses,
-        linear_modules=tuple(metadata.get("linear_modules", LINEAR_MODULES)),
+        events=np.load(root / "events.npy"),
+        scenario_ids=np.load(root / "scenario_ids.npy"),
+        base_sample_ids=np.load(root / "base_sample_ids.npy"),
+        losses=np.load(root / "losses.npy"),
+        position_losses=np.load(root / "position_losses.npy"),
     )
     for unit_type in UNIT_TYPES:
         for layer_id in range(cache.num_layers):
-            if not cache.layer_path(layer_id, unit_type).exists():
-                raise FileNotFoundError(cache.layer_path(layer_id, unit_type))
-    for layer_id in range(cache.num_layers):
-        for module_name in cache.linear_modules:
-            if not cache.activation_scale_path(layer_id, module_name).exists():
-                raise FileNotFoundError(cache.activation_scale_path(layer_id, module_name))
+            path = cache.layer_path(layer_id, unit_type)
+            if not path.exists():
+                raise FileNotFoundError(path)
+    if version == 5:
+        print(
+            "[paper cache] reusing a compatible v7 response cache. Extra files from the old "
+            "weight-mask backend are ignored by v8.",
+            flush=True,
+        )
     return cache
 
 
@@ -197,12 +167,12 @@ def collect_gradient_response_cache(
     event_bins: int = 3,
     overwrite: bool = False,
 ) -> ResponseCache:
-    """Collect task-gradient responses for MLP channels and attention heads.
+    """Collect only the task-gradient responses required by the proposal.
 
-    MLP channel response follows the detailed proposal: the absolute task-loss
-    gradient with respect to the FFN intermediate activation. Attention response
-    is the L2 norm of the task-loss gradient over each head feature dimension.
-    Both retain sequence position for the later standardization and DCT.
+    MLP response is |dL/dA_j(t)| at the FFN intermediate channel. Attention
+    response is the L2 norm of dL/dO_h(t,:) over the head feature dimension.
+    No separate weight-magnitude or activation-statistic pruning signal is
+    collected in this v8 implementation.
     """
     root = Path(cache_dir)
     metadata_path = root / "metadata.json"
@@ -223,10 +193,7 @@ def collect_gradient_response_cache(
     attention_layouts: Dict[int, Dict[str, int]] = {}
     maps: Dict[str, Dict[int, np.memmap]] = {"mlp": {}, "attention": {}}
     for layer_id, layer in enumerate(layers):
-        down_proj = getattr(getattr(layer, "mlp", None), "down_proj", None)
-        if down_proj is None or not hasattr(down_proj, "in_features"):
-            raise AttributeError(f"layer {layer_id} has no Llama/Mistral-style mlp.down_proj")
-        mlp_count = int(down_proj.in_features)
+        mlp_count = int(layer.mlp.down_proj.in_features)
         layout = _attention_layout(layer, model)
         head_count = int(layout["num_heads"])
         unit_counts["mlp"][layer_id] = mlp_count
@@ -234,54 +201,29 @@ def collect_gradient_response_cache(
         attention_layouts[layer_id] = layout
         maps["mlp"][layer_id] = np.lib.format.open_memmap(
             root / f"layer_{layer_id:03d}_mlp_responses.npy",
-            mode="w+",
-            dtype=np.float16,
+            mode="w+", dtype=np.float16,
             shape=(observations, mlp_count, response_length),
         )
         maps["attention"][layer_id] = np.lib.format.open_memmap(
             root / f"layer_{layer_id:03d}_attention_responses.npy",
-            mode="w+",
-            dtype=np.float16,
+            mode="w+", dtype=np.float16,
             shape=(observations, head_count, response_length),
         )
-
-    activation_sums: Dict[int, Dict[str, torch.Tensor]] = {}
-    activation_counts: Dict[int, Dict[str, int]] = {}
-    for layer_id, layer in enumerate(layers):
-        activation_sums[layer_id] = {}
-        activation_counts[layer_id] = {}
-        for module_name in LINEAR_MODULES:
-            module = layer
-            for part in module_name.split("."):
-                module = getattr(module, part)
-            activation_sums[layer_id][module_name] = torch.zeros(
-                int(module.in_features), device=module.weight.device, dtype=torch.float32
-            )
-            activation_counts[layer_id][module_name] = 0
 
     losses = np.zeros(observations, dtype=np.float64)
     position_losses = np.zeros((observations, response_length), dtype=np.float32)
     scenario_ids = np.zeros(observations, dtype=np.int64)
     base_sample_ids = np.zeros(observations, dtype=np.int64)
-    written = {
-        unit_type: np.zeros((observations, num_layers), dtype=bool)
-        for unit_type in UNIT_TYPES
-    }
+    written = {unit_type: np.zeros((observations, num_layers), dtype=bool) for unit_type in UNIT_TYPES}
     state = {"row": -1}
     handles = []
 
-    def register_response_hook(
-        module: torch.nn.Module,
-        layer_id: int,
-        unit_type: str,
-        transform,
-    ) -> None:
+    def register_response_hook(module: torch.nn.Module, layer_id: int, unit_type: str, transform) -> None:
         def pre_hook(_module, inputs):
             activation = inputs[0]
             if not activation.requires_grad:
                 raise RuntimeError(
-                    f"{unit_type} response tensor has no gradient. The collector requires "
-                    "model.enable_input_require_grads() or trainable embeddings."
+                    f"{unit_type} response tensor has no gradient. Enable input gradients for collection."
                 )
             row = int(state["row"])
             detached_activation = activation.detach()
@@ -298,23 +240,7 @@ def collect_gradient_response_cache(
 
         handles.append(module.register_forward_pre_hook(pre_hook))
 
-    def register_activation_hook(module: torch.nn.Module, layer_id: int, module_name: str) -> None:
-        def pre_hook(_module, inputs):
-            activation = inputs[0].detach().float()
-            reduce_dims = tuple(range(activation.ndim - 1))
-            activation_sums[layer_id][module_name].add_(activation.square().sum(dim=reduce_dims))
-            activation_counts[layer_id][module_name] += int(activation.numel() // activation.shape[-1])
-            return None
-
-        handles.append(module.register_forward_pre_hook(pre_hook))
-
     for layer_id, layer in enumerate(layers):
-        for module_name in LINEAR_MODULES:
-            module = layer
-            for part in module_name.split("."):
-                module = getattr(module, part)
-            register_activation_hook(module, layer_id, module_name)
-
         register_response_hook(
             layer.mlp.down_proj,
             layer_id,
@@ -327,19 +253,11 @@ def collect_gradient_response_cache(
 
         def attention_transform(activation, gradient, h=num_heads, d=head_dim):
             if activation.shape[-1] != h * d:
-                raise ValueError(
-                    f"o_proj input width {activation.shape[-1]} does not match {h} heads x {d}"
-                )
-            del activation
+                raise ValueError(f"attention response width {activation.shape[-1]} != {h} x {d}")
             response = gradient.reshape(gradient.shape[0], gradient.shape[1], h, d)
             return torch.linalg.vector_norm(response, ord=2, dim=-1).transpose(1, 2)
 
-        register_response_hook(
-            layer.self_attn.o_proj,
-            layer_id,
-            "attention",
-            attention_transform,
-        )
+        register_response_hook(layer.self_attn.o_proj, layer_id, "attention", attention_transform)
 
     original_use_cache = getattr(model.config, "use_cache", None)
     if original_use_cache is not None:
@@ -354,11 +272,7 @@ def collect_gradient_response_cache(
         input_grad_enabled = True
     else:
         embedding = model.get_input_embeddings()
-
-        def require_embedding_grad(_module, _inputs, output):
-            output.requires_grad_(True)
-
-        handles.append(embedding.register_forward_hook(require_embedding_grad))
+        handles.append(embedding.register_forward_hook(lambda _m, _i, output: output.requires_grad_(True)))
 
     model.eval()
     device = _input_device(model)
@@ -379,12 +293,9 @@ def collect_gradient_response_cache(
                 shift_labels = input_ids[:, 1:].contiguous()
                 token_nll = F.cross_entropy(
                     shift_logits.reshape(-1, shift_logits.shape[-1]),
-                    shift_labels.reshape(-1),
-                    reduction="none",
+                    shift_labels.reshape(-1), reduction="none",
                 ).reshape(shift_labels.shape)
-                pooled_nll = F.adaptive_avg_pool1d(
-                    token_nll.unsqueeze(1), response_length
-                ).squeeze(1).mean(dim=0)
+                pooled_nll = F.adaptive_avg_pool1d(token_nll.unsqueeze(1), response_length).squeeze(1).mean(dim=0)
                 position_losses[row] = pooled_nll.detach().cpu().numpy().astype(np.float32)
                 losses[row] = float(token_nll.mean().detach().cpu())
                 scenario_ids[row] = scenario_id
@@ -396,9 +307,9 @@ def collect_gradient_response_cache(
                         raise RuntimeError(
                             f"{unit_type} gradient response missing for layers {missing} at observation {row}"
                         )
-                del outputs, loss, input_ids, shift_logits, shift_labels, token_nll, pooled_nll
                 row += 1
                 print(f"[paper response] observation {row}/{observations}", flush=True)
+                del outputs, loss, input_ids, shift_logits, shift_labels, token_nll, pooled_nll
                 if torch.cuda.is_available() and row % 8 == 0:
                     torch.cuda.empty_cache()
     finally:
@@ -414,17 +325,7 @@ def collect_gradient_response_cache(
     for unit_type in UNIT_TYPES:
         for mmap in maps[unit_type].values():
             mmap.flush()
-    for layer_id in range(num_layers):
-        for module_name in LINEAR_MODULES:
-            count = activation_counts[layer_id][module_name]
-            if count <= 0:
-                raise RuntimeError(f"no activation statistics collected for layer {layer_id} {module_name}")
-            mean_square = (activation_sums[layer_id][module_name] / float(count)).detach().cpu().numpy()
-            safe_name = module_name.replace(".", "__")
-            np.save(
-                root / f"layer_{layer_id:03d}_{safe_name}_input_scale.npy",
-                mean_square.astype(np.float32, copy=False),
-            )
+
     events = _quantile_events(losses, event_bins)
     np.save(root / "events.npy", events)
     np.save(root / "scenario_ids.npy", scenario_ids)
@@ -440,18 +341,14 @@ def collect_gradient_response_cache(
             unit_type: {str(key): value for key, value in layer_map.items()}
             for unit_type, layer_map in unit_counts.items()
         },
-        "attention_layouts": {
-            str(key): value for key, value in attention_layouts.items()
-        },
-        "linear_modules": list(LINEAR_MODULES),
+        "attention_layouts": {str(key): value for key, value in attention_layouts.items()},
         "scenario_ratios": ratios,
         "event_bins": event_bins,
         "response_definitions": {
-            "mlp": "abs(d(causal_lm_loss)/d(down_proj_input))",
-            "attention": "l2_head_dim(d(causal_lm_loss)/d(o_proj_input))",
+            "mlp": "abs(d(causal_lm_loss)/d(ffn_intermediate_channel))",
+            "attention": "l2_head_dim(d(causal_lm_loss)/d(attention_head_output))",
         },
         "task_event_definition": "global quantile bins of mean position-level next-token NLL",
-        "activation_scale_definition": "legacy diagnostic mean over calibration tokens of linear-module input squared",
     }
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     return load_response_cache(root)

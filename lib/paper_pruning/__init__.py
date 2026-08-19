@@ -1,8 +1,8 @@
-"""Frequency-MI, granular-ball, LCB and budget-aware pruning utilities."""
+"""Paper-only frequency-MI, granular-ball, LCB and weight-budget utilities."""
 
 from .config import BudgetConfig, FrequencyConfig, GranularBallConfig, LCBConfig, PipelineConfig
 from .pipeline import LayerAblationScores, score_layer
-from .selection import resolve_prune_count, select_bottom_k, split_into_steps
+from .weight_budget import WeightBudget, allocate_weight_budget, apply_weight_budget_
 
 __all__ = [
     "BudgetConfig",
@@ -12,7 +12,7 @@ __all__ = [
     "PipelineConfig",
     "LayerAblationScores",
     "score_layer",
-    "resolve_prune_count",
-    "select_bottom_k",
-    "split_into_steps",
+    "WeightBudget",
+    "allocate_weight_budget",
+    "apply_weight_budget_",
 ]

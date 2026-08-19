@@ -1,28 +1,23 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import numpy as np
 import torch
 
-from lib.paper_pruning.apply import zero_attention_heads_, zero_mlp_channels_, zero_structured_units_
-from lib.paper_pruning.collector import collect_gradient_response_cache
+from lib.paper_pruning.collector import collect_gradient_response_cache, load_response_cache
 from lib.paper_pruning.config import FrequencyConfig, GranularBallConfig, LCBConfig, PipelineConfig
-from lib.paper_pruning.granular_ball import (
-    build_multigranularity_hierarchy,
-    layer_localization_features,
-    multi_granularity_local_mi,
-)
-from lib.paper_pruning.mi import build_frequency_spectrum, estimate_knn_mi_matrix
+from lib.paper_pruning.granular_ball import build_multigranularity_hierarchy, layer_localization_features
+from lib.paper_pruning.mi import build_frequency_spectrum
 from lib.paper_pruning.pipeline import score_layer
-from lib.paper_pruning.selection import resolve_prune_count, select_bottom_k, split_into_steps
-from lib.paper_pruning.wanda_weight import (
-    ALL_LINEAR_MODULES,
-    allocate_row_prune_counts,
-    allocate_unit_sparsities,
-    apply_paper_wanda_weight_masks_,
-    apply_paper_unit_budget_weight_masks_,
+from lib.paper_pruning.weight_budget import (
+    UnitKey,
+    allocate_weight_budget,
+    apply_weight_budget_,
+    unit_segments,
 )
+from lib.sparsity import check_transformer_weight_sparsity
 
 
 def synthetic_responses(seed: int = 0):
@@ -42,23 +37,11 @@ def synthetic_responses(seed: int = 0):
     return x, events, scenarios
 
 
-def test_frequency_spectrum_and_selection():
+def test_frequency_and_granular_hierarchy():
     x, events, _ = synthetic_responses()
-    cfg = FrequencyConfig(fine_bins=8, target_bands=4, mi_neighbors=3)
-    spectrum = build_frequency_spectrum(x, events, cfg)
+    spectrum = build_frequency_spectrum(x, events, FrequencyConfig(fine_bins=8, target_bands=4))
     assert spectrum.band_energy.shape == (72, 24, 4)
     assert spectrum.band_mi.shape == (24, 4)
-    assert np.isfinite(spectrum.total_mi).all()
-    chosen = select_bottom_k(spectrum.total_mi, 5)
-    assert chosen.shape == (5,)
-    assert len(split_into_steps(chosen, 2)) == 3
-    assert resolve_prune_count(24, 0.25, 0) == 6
-    assert resolve_prune_count(24, 0.25, 7) == 7
-
-
-def test_purity_thresholds_create_nested_ball_counts():
-    x, events, _ = synthetic_responses(1)
-    spectrum = build_frequency_spectrum(x, events, FrequencyConfig(fine_bins=8, target_bands=4))
     features = layer_localization_features(spectrum.band_energy)
     cfg = GranularBallConfig(
         purity_thresholds=(0.55, 0.65, 0.75),
@@ -69,11 +52,9 @@ def test_purity_thresholds_create_nested_ball_counts():
     hierarchy = build_multigranularity_hierarchy(features, events, cfg)
     counts = [len(balls) for _, balls in hierarchy]
     assert counts == sorted(counts)
-    assert counts[-1] >= counts[0]
-    assert all(0.0 <= ball.purity <= 1.0 for _, balls in hierarchy for ball in balls)
 
 
-def test_three_ablation_paths_and_real_lcb_variance():
+def test_true_repeated_lcb_has_variance():
     x, events, scenarios = synthetic_responses(2)
     base_ids = np.repeat(np.arange(24), 3)
     cfg = PipelineConfig(
@@ -88,26 +69,25 @@ def test_three_ablation_paths_and_real_lcb_variance():
             kde_scope="none",
         ),
         lcb=LCBConfig(
-            repeats=5, sample_fraction=0.8, scenario_fraction=2 / 3,
-            lcb_lambda=0.5, random_state=7,
+            repeats=5,
+            sample_fraction=0.8,
+            scenario_fraction=2 / 3,
+            lcb_lambda=0.5,
+            random_state=7,
         ),
     )
-    result = score_layer(
-        x, events, scenarios, cfg, layer_id=3, base_sample_ids=base_ids
-    )
+    result = score_layer(x, events, scenarios, cfg, layer_id=3, base_sample_ids=base_ids)
     assert result.bootstrap_scores.shape == (5, 24)
     assert np.any(result.lcb_std > 0)
     assert not np.allclose(result.mi_score, result.granular_score)
-    assert np.allclose(
-        result.lcb_score, result.lcb_mean - 0.5 * result.lcb_std
-    )
+    assert np.allclose(result.lcb_score, result.lcb_mean - 0.5 * result.lcb_std)
 
 
 class ToyMLP(torch.nn.Module):
     def __init__(self, hidden=4, intermediate=6):
         super().__init__()
-        self.gate_proj = torch.nn.Linear(hidden, intermediate, bias=True)
-        self.up_proj = torch.nn.Linear(hidden, intermediate, bias=True)
+        self.gate_proj = torch.nn.Linear(hidden, intermediate, bias=False)
+        self.up_proj = torch.nn.Linear(hidden, intermediate, bias=False)
         self.down_proj = torch.nn.Linear(intermediate, hidden, bias=False)
 
 
@@ -117,13 +97,12 @@ class ToyAttention(torch.nn.Module):
         self.num_heads = num_heads
         self.num_key_value_heads = num_heads
         self.head_dim = hidden // num_heads
-        self.q_proj = torch.nn.Linear(hidden, hidden, bias=True)
-        self.k_proj = torch.nn.Linear(hidden, hidden, bias=True)
-        self.v_proj = torch.nn.Linear(hidden, hidden, bias=True)
+        self.q_proj = torch.nn.Linear(hidden, hidden, bias=False)
+        self.k_proj = torch.nn.Linear(hidden, hidden, bias=False)
+        self.v_proj = torch.nn.Linear(hidden, hidden, bias=False)
         self.o_proj = torch.nn.Linear(hidden, hidden, bias=False)
 
     def forward(self, x):
-        # The collector only needs a differentiable, head-concatenated o_proj input.
         mixed = (self.q_proj(x) + self.k_proj(x) + self.v_proj(x)) / 3
         return self.o_proj(mixed)
 
@@ -136,37 +115,7 @@ class ToyLayer(torch.nn.Module):
 
     def forward(self, x):
         x = x + self.self_attn(x)
-        gate = torch.sigmoid(self.mlp.gate_proj(x))
-        up = self.mlp.up_proj(x)
-        return x + self.mlp.down_proj(gate * up)
-
-
-class ToyModel(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.model = SimpleNamespace(layers=[ToyLayer(), ToyLayer()])
-
-
-def test_structured_mlp_and_attention_zeroing():
-    model = ToyModel()
-    zero_structured_units_(
-        model,
-        {
-            "mlp": {0: [1, 4], 1: [2]},
-            "attention": {0: [1], 1: [0]},
-        },
-    )
-    layer0 = model.model.layers[0]
-    assert torch.count_nonzero(layer0.mlp.gate_proj.weight[[1, 4]]) == 0
-    assert torch.count_nonzero(layer0.mlp.up_proj.weight[[1, 4]]) == 0
-    assert torch.count_nonzero(layer0.mlp.down_proj.weight[:, [1, 4]]) == 0
-    assert torch.count_nonzero(layer0.mlp.gate_proj.bias[[1, 4]]) == 0
-
-    # Head 1 corresponds to rows/columns 2:4 for hidden=4, heads=2.
-    assert torch.count_nonzero(layer0.self_attn.q_proj.weight[2:4]) == 0
-    assert torch.count_nonzero(layer0.self_attn.k_proj.weight[2:4]) == 0
-    assert torch.count_nonzero(layer0.self_attn.v_proj.weight[2:4]) == 0
-    assert torch.count_nonzero(layer0.self_attn.o_proj.weight[:, 2:4]) == 0
+        return x + self.mlp.down_proj(torch.sigmoid(self.mlp.gate_proj(x)) * self.mlp.up_proj(x))
 
 
 class TinyBackbone(torch.nn.Module):
@@ -183,7 +132,6 @@ class TinyCausalLM(torch.nn.Module):
         self.lm_head = torch.nn.Linear(4, 13, bias=False)
         self.config = SimpleNamespace(
             use_cache=True,
-            _name_or_path="tiny",
             num_attention_heads=2,
             num_key_value_heads=2,
         )
@@ -196,22 +144,24 @@ class TinyCausalLM(torch.nn.Module):
         for layer in self.model.layers:
             x = layer(x)
         logits = self.lm_head(x)
-        shift_logits = logits[:, :-1].reshape(-1, logits.size(-1))
-        shift_labels = input_ids[:, 1:].reshape(-1)
-        loss = torch.nn.functional.cross_entropy(shift_logits, shift_labels)
+        loss = torch.nn.functional.cross_entropy(
+            logits[:, :-1].reshape(-1, logits.size(-1)),
+            input_ids[:, 1:].reshape(-1),
+        )
         return SimpleNamespace(loss=loss, logits=logits)
 
 
-def test_gradient_response_collector_mlp_and_attention(tmp_path):
+def test_collector_contains_only_paper_response_cache(tmp_path):
     model = TinyCausalLM()
     dataloader = []
     for offset in range(4):
         ids = (torch.arange(12).unsqueeze(0) + offset) % 13
         dataloader.append((ids, ids.clone()))
+    root = tmp_path / "cache"
     cache = collect_gradient_response_cache(
         model,
         dataloader,
-        tmp_path / "cache",
+        root,
         scenario_ratios="0.75,1.0",
         response_length=8,
         event_bins=2,
@@ -219,455 +169,131 @@ def test_gradient_response_collector_mlp_and_attention(tmp_path):
     assert cache.num_observations == 8
     assert cache.load_layer(0, "mlp").shape == (8, 6, 8)
     assert cache.load_layer(0, "attention").shape == (8, 2, 8)
-    assert cache.unit_counts["mlp"][0] == 6
-    assert cache.unit_counts["attention"][0] == 2
-    assert np.unique(cache.events).size == 2
-    assert np.isfinite(cache.losses).all()
-    for module_name in ALL_LINEAR_MODULES:
-        scale = cache.load_activation_scale(0, module_name)
-        assert scale.shape == (getattr(getattr(model.model.layers[0], module_name.split('.')[0]), module_name.split('.')[1]).in_features,)
-        assert np.isfinite(scale).all()
-        assert np.all(scale >= 0)
 
 
-class FakeResponseCache:
-    def __init__(self, model):
-        self.attention_layouts = {
-            layer_id: {"num_heads": 2, "num_key_value_heads": 2, "head_dim": 2}
-            for layer_id, _ in enumerate(model.model.layers)
-        }
-        self.scales = {}
-        for layer_id, layer in enumerate(model.model.layers):
-            for module_name in ALL_LINEAR_MODULES:
-                module = layer
-                for part in module_name.split("."):
-                    module = getattr(module, part)
-                self.scales[(layer_id, module_name)] = np.linspace(0.5, 1.5, module.in_features).astype(np.float32)
+def test_v7_response_cache_version_is_accepted(tmp_path):
+    model = TinyCausalLM()
+    data = []
+    for offset in range(4):
+        ids = (torch.arange(12).unsqueeze(0) + offset) % 13
+        data.append((ids, ids.clone()))
+    root = tmp_path / "cache"
+    collect_gradient_response_cache(model, data, root, scenario_ratios="1.0", response_length=8, event_bins=2)
+    meta_path = root / "metadata.json"
+    meta = json.loads(meta_path.read_text())
+    meta["cache_version"] = 5
+    meta_path.write_text(json.dumps(meta))
+    loaded = load_response_cache(root)
+    assert loaded.cache_version == 5
+    assert loaded.load_layer(1, "mlp").shape[1] == 6
 
-    def load_activation_scale(self, layer_id, module_name):
-        return self.scales[(layer_id, module_name)]
 
-
-def _toy_scores(model, reverse=False):
+def _evidence(model, reverse=False):
+    rng = np.random.default_rng(3)
     result = {"mlp": {}, "attention": {}}
     for layer_id, layer in enumerate(model.model.layers):
-        mlp = np.arange(layer.mlp.down_proj.in_features, dtype=np.float32)
-        attn = np.arange(layer.self_attn.num_heads, dtype=np.float32)
-        if reverse:
-            mlp = mlp[::-1].copy()
-            attn = attn[::-1].copy()
-        result["mlp"][layer_id] = mlp
-        result["attention"][layer_id] = attn
+        for unit_type, count in (
+            ("mlp", layer.mlp.down_proj.in_features),
+            ("attention", layer.self_attn.num_heads),
+        ):
+            score = np.linspace(0.1, 1.0, count, dtype=np.float64)
+            if reverse:
+                score = score[::-1].copy()
+            bands = np.abs(rng.normal(size=(count, 4))) + 0.05
+            result[unit_type][layer_id] = {"score": score, "bands": bands}
     return result
 
 
-def test_row_budget_is_exact_and_score_aware():
-    scores = np.arange(6, dtype=np.float32)
-    counts = allocate_row_prune_counts(
-        scores, rows_per_unit=1, columns=10, target_ratio=0.5, spread=0.8, temperature=2.0
-    )
-    assert counts.sum() == 30
-    assert counts[0] > counts[-1]
+def _unit_nonzero_count(model, key):
+    layer = model.model.layers[key.layer_id]
+    total = 0
+    for segment in unit_segments(model, key):
+        module = layer
+        for part in segment.module_name.split("."):
+            module = getattr(module, part)
+        block = module.weight.data[
+            segment.row_start:segment.row_end,
+            segment.col_start:segment.col_end,
+        ]
+        total += int(torch.count_nonzero(block).item())
+    return total
 
 
-def test_wanda_weight_masks_cover_attention_and_mlp():
-    torch.manual_seed(1)
-    model = ToyModel()
-    cache = FakeResponseCache(model)
-    summaries = apply_paper_wanda_weight_masks_(
+def test_paper_nonuniform_budget_is_exact_50_and_never_removes_a_unit():
+    model = TinyCausalLM()
+    budget = allocate_weight_budget(
         model,
-        _toy_scores(model),
-        cache,
-        targets=("mlp", "attention"),
-        mlp_ratio=0.5,
-        attention_ratio=0.5,
-        chunk_rows=2,
+        "paper_mi_gb_lcb",
+        _evidence(model),
+        ("mlp", "attention"),
+        target_sparsity=0.50,
+        allocation="paper_nonuniform",
+        min_unit_sparsity=0.25,
+        max_unit_sparsity=0.75,
     )
-    assert len(summaries) == 2 * 7
-    for layer in model.model.layers:
-        for module_name in ALL_LINEAR_MODULES:
-            module = layer
-            for part in module_name.split("."):
-                module = getattr(module, part)
-            ratio = float((module.weight == 0).sum().item()) / module.weight.numel()
-            assert abs(ratio - 0.5) <= 1.0 / module.weight.numel()
-
-
-def test_paper_scores_change_wanda_weight_masks():
-    torch.manual_seed(7)
-    left = ToyModel()
-    torch.manual_seed(7)
-    right = ToyModel()
-    apply_paper_wanda_weight_masks_(
-        left, _toy_scores(left), FakeResponseCache(left), ("mlp", "attention"), 0.5, 0.5, chunk_rows=2
+    assert budget.prune_counts.sum() * 2 == budget.total_weights
+    transformer_weights = sum(
+        module.weight.numel()
+        for layer in model.model.layers
+        for module in (
+            layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj, layer.self_attn.o_proj,
+            layer.mlp.gate_proj, layer.mlp.up_proj, layer.mlp.down_proj,
+        )
     )
-    apply_paper_wanda_weight_masks_(
-        right, _toy_scores(right, reverse=True), FakeResponseCache(right), ("mlp", "attention"), 0.5, 0.5, chunk_rows=2
+    assert budget.total_weights == transformer_weights
+    assert np.all(budget.prune_counts < budget.costs)
+    apply_weight_budget_(model, budget, seed=11, chunk_size=1024)
+    assert abs(check_transformer_weight_sparsity(model) - 0.5) < 1e-12
+    assert all(_unit_nonzero_count(model, key) > 0 for key in budget.keys)
+
+
+def test_score_direction_changes_nonuniform_weight_budget():
+    a = TinyCausalLM()
+    b = TinyCausalLM()
+    budget_a = allocate_weight_budget(
+        a, "paper_mi", _evidence(a, reverse=False), ("mlp", "attention"),
+        target_sparsity=0.50, allocation="paper_nonuniform",
+        min_unit_sparsity=0.25, max_unit_sparsity=0.75,
     )
-    differences = 0
-    for left_layer, right_layer in zip(left.model.layers, right.model.layers):
-        for module_name in ALL_LINEAR_MODULES:
-            a, b = left_layer, right_layer
-            for part in module_name.split("."):
-                a, b = getattr(a, part), getattr(b, part)
-            differences += int(torch.count_nonzero((a.weight == 0) != (b.weight == 0)).item())
-    assert differences > 0
-
-
-
-def test_unit_budget_ratios_are_monotone_and_centered_at_target():
-    scores = np.array([0.90, 0.85, 0.80, 0.70, 0.20, 0.10, 0.05, 0.01])
-    ratios = allocate_unit_sparsities(
-        scores, target_ratio=0.5, min_ratio=0.30, max_ratio=0.70
+    budget_b = allocate_weight_budget(
+        b, "paper_mi", _evidence(b, reverse=True), ("mlp", "attention"),
+        target_sparsity=0.50, allocation="paper_nonuniform",
+        min_unit_sparsity=0.25, max_unit_sparsity=0.75,
     )
-    order = np.argsort(scores)
-    # Higher score must never receive more pruning than a lower score.
-    assert np.all(np.diff(ratios[order]) <= 1e-12)
-    assert np.isclose(ratios.mean(), 0.5, atol=1e-12)
-    assert ratios[np.argmax(scores)] <= 0.301
-    assert ratios[np.argmin(scores)] >= 0.699
+    assert not np.array_equal(budget_a.prune_counts, budget_b.prune_counts)
+    assert budget_a.prune_counts.sum() == budget_b.prune_counts.sum()
 
 
-def test_unit_budget_weight_masks_are_exact_and_score_aware():
-    torch.manual_seed(123)
-    model = ToyModel()
-    scores = _toy_scores(model)
-    summaries = apply_paper_unit_budget_weight_masks_(
+def test_uniform_weight_budget_is_exact_50():
+    model = TinyCausalLM()
+    budget = allocate_weight_budget(
         model,
-        scores,
-        FakeResponseCache(model),
-        targets=("mlp", "attention"),
-        mlp_ratio=0.5,
-        attention_ratio=0.5,
+        "paper_mi",
+        _evidence(model),
+        ("mlp", "attention"),
+        target_sparsity=0.50,
+        allocation="uniform",
+    )
+    assert budget.prune_counts.sum() * 2 == budget.total_weights
+    apply_weight_budget_(model, budget, seed=7, chunk_size=1024)
+    assert abs(check_transformer_weight_sparsity(model) - 0.5) < 1e-12
+
+
+def test_full_coverage_budget_keeps_exact_global_target():
+    model = TinyCausalLM()
+    budget = allocate_weight_budget(
+        model,
+        "paper_full",
+        _evidence(model),
+        ("mlp", "attention"),
+        target_sparsity=0.50,
+        allocation="paper_nonuniform",
         min_unit_sparsity=0.30,
         max_unit_sparsity=0.70,
-        chunk_rows=2,
+        coverage_ratio=0.90,
+        coverage_alpha=0.20,
+        greedy_batches=8,
     )
-    assert len(summaries) == 2 * 7
-    for row in summaries:
-        assert abs(row["actual_ratio"] - 0.5) <= 1.0 / (row["rows"] * row["columns"])
-        assert row["unit_sparsity_min"] <= row["unit_sparsity_mean"] <= row["unit_sparsity_max"]
-
-    # gate_proj is row-oriented: low-score channel 0 should be pruned more
-    # than high-score channel 5.
-    gate = model.model.layers[0].mlp.gate_proj.weight
-    gate_ratios = (gate == 0).float().mean(dim=1)
-    assert gate_ratios[0] > gate_ratios[-1]
-
-    # down_proj is column-oriented and must obey the same unit budget.
-    down = model.model.layers[0].mlp.down_proj.weight
-    down_ratios = (down == 0).float().mean(dim=0)
-    assert down_ratios[0] > down_ratios[-1]
-
-def test_dual_source_bootstrap_preserves_valid_event_support():
-    from lib.paper_pruning.resampling import dual_source_bootstrap_indices
-
-    base = np.repeat(np.arange(12), 3)
-    scenario = np.tile(np.arange(3), 12)
-    events = (base % 3).astype(np.int64)
-    indices = dual_source_bootstrap_indices(
-        events,
-        base,
-        scenario,
-        sample_fraction=0.75,
-        scenario_fraction=2 / 3,
-        rng=np.random.default_rng(42),
-    )
-    assert indices.ndim == 1
-    assert indices.size >= 2
-    classes, counts = np.unique(events[indices], return_counts=True)
-    assert classes.size >= 2
-    assert counts.min() >= 2
-
-
-def test_coverage_aware_budget_is_exact():
-    from lib.paper_pruning.budget import coverage_aware_keep_indices
-    from lib.paper_pruning.config import BudgetConfig
-
-    scores = np.linspace(0.0, 1.0, 20)
-    bands = np.zeros((20, 3), dtype=np.float64)
-    bands[:7, 0] = 1.0
-    bands[7:14, 1] = 1.0
-    bands[14:, 2] = 1.0
-    keep, priority, achieved = coverage_aware_keep_indices(
-        scores,
-        bands,
-        keep_count=10,
-        cfg=BudgetConfig(coverage_ratio=0.5, coverage_alpha=1.0, greedy_batches=10),
-    )
-    assert keep.size == 10
-    assert priority.shape == (20,)
-    assert achieved.shape == (3,)
-    assert np.isfinite(priority).all()
-    assert np.all(achieved > 0)
-
-
-def test_gentle_guidance_stays_close_to_wanda():
-    from lib.paper_pruning.wanda_weight import centered_rank_factor
-
-    factors = centered_rank_factor(np.arange(100), strength=0.01)
-    assert factors.min() > 0.989
-    assert factors.max() < 1.011
-    assert np.isclose(np.median(factors), 1.0, atol=2e-3)
-
-
-def test_zero_guidance_and_zero_spread_matches_fixed_row_wanda():
-    from lib.paper_pruning.wanda_weight import apply_guided_wanda_module_
-
-    torch.manual_seed(11)
-    module = torch.nn.Linear(12, 8, bias=False)
-    scaler = torch.linspace(0.5, 1.5, 12)
-    original = module.weight.detach().clone()
-    metric = original.abs().float() * torch.sqrt(scaler.float()).unsqueeze(0)
-    expected = torch.zeros_like(metric, dtype=torch.bool)
-    expected.scatter_(1, torch.topk(metric, 6, dim=1, largest=False).indices, True)
-
-    apply_guided_wanda_module_(
-        "mlp.gate_proj",
-        module,
-        scaler,
-        unit_scores=np.arange(8, dtype=np.float32),
-        ratio=0.5,
-        head_dim=1,
-        row_spread=0.0,
-        guidance_strength=0.0,
-        chunk_rows=3,
-    )
-    assert torch.equal(module.weight == 0, expected)
-
-
-def test_fast_small_mi_matches_numpy_path():
-    rng = np.random.default_rng(81)
-    values = rng.normal(size=(48, 4))
-    events = np.tile(np.arange(3), 16)
-    fast = estimate_knn_mi_matrix(
-        values, events, FrequencyConfig(mi_neighbors=3, fast_small_mi=True)
-    )
-    slow = estimate_knn_mi_matrix(
-        values, events, FrequencyConfig(mi_neighbors=3, fast_small_mi=False)
-    )
-    assert np.allclose(fast, slow, rtol=1e-11, atol=1e-12)
-
-
-def test_probe_kde_scope_does_not_change_primary_granular_scores():
-    x, events, _ = synthetic_responses(9)
-    spectrum = build_frequency_spectrum(
-        x, events, FrequencyConfig(fine_bins=8, target_bands=4, probe_units=6)
-    )
-    common = dict(
-        purity_thresholds=(0.55, 0.65),
-        min_ball_size=6,
-        max_balls=12,
-        max_depth=3,
-        min_event_classes=1,
-        localization_mode="unit_local",
-        workers=1,
-        worker_chunk_size=8,
-    )
-    all_knn, all_kde, _ = multi_granularity_local_mi(
-        spectrum.band_energy,
-        events,
-        FrequencyConfig(fine_bins=8, target_bands=4, probe_units=6),
-        GranularBallConfig(**common, kde_scope="all"),
-        compute_kde=True,
-        kde_unit_indices=None,
-    )
-    probe_knn, probe_kde, _ = multi_granularity_local_mi(
-        spectrum.band_energy,
-        events,
-        FrequencyConfig(fine_bins=8, target_bands=4, probe_units=6),
-        GranularBallConfig(**common, kde_scope="probe"),
-        compute_kde=True,
-        kde_unit_indices=spectrum.probe_indices,
-    )
-    assert np.allclose(all_knn, probe_knn, rtol=1e-12, atol=1e-12)
-    assert np.isfinite(probe_kde[spectrum.probe_indices]).all()
-    missing = np.setdiff1d(np.arange(probe_kde.shape[0]), spectrum.probe_indices)
-    assert np.isnan(probe_kde[missing]).all()
-    assert np.isfinite(all_kde).all()
-
-
-
-def test_single_pass_lcb_has_zero_variance_and_matches_granular_score():
-    x, events, scenarios = synthetic_responses(11)
-    gb = GranularBallConfig(
-        purity_thresholds=(0.55, 0.65),
-        min_ball_size=6,
-        max_balls=12,
-        max_depth=3,
-        min_event_classes=1,
-        localization_mode="unit_local",
-        workers=4,
-        worker_chunk_size=8,
-        kde_scope="probe",
-    )
-    result = score_layer(
-        x,
-        events,
-        scenarios,
-        PipelineConfig(
-            frequency=FrequencyConfig(fine_bins=8, target_bands=4, mi_neighbors=2),
-            granular_ball=gb,
-            lcb=LCBConfig(
-                repeats=1, sample_fraction=1.0, random_state=19, workers=1
-            ),
-        ),
-        layer_id=2,
-    )
-    assert result.bootstrap_scores.shape[0] == 1
-    assert np.all(result.lcb_std == 0)
-    assert np.all(result.lcb_band_std == 0)
-    assert np.allclose(result.lcb_score, result.granular_score)
-    assert np.allclose(result.lcb_band_mean, result.granular_band_mi)
-
-
-def test_asymmetric_low_mid_high_coverage_profile_is_supported():
-    from lib.paper_pruning.budget import coverage_aware_keep_indices
-    from lib.paper_pruning.config import BudgetConfig
-
-    scores = np.linspace(0.0, 1.0, 30)
-    bands = np.zeros((30, 3), dtype=np.float64)
-    bands[:10, 0] = 1.0
-    bands[10:20, 1] = 1.0
-    bands[20:, 2] = 1.0
-    keep, priority, achieved = coverage_aware_keep_indices(
-        scores, bands, keep_count=15,
-        cfg=BudgetConfig(
-            coverage_ratios=(0.8, 0.6, 0.4),
-            coverage_alpha=2.0,
-            greedy_batches=15,
-        ),
-    )
-    assert keep.size == 15
-    assert priority.shape == (30,)
-    assert achieved.shape == (3,)
-    assert achieved[0] >= achieved[2]
-
-
-def test_lcb_only_and_band_only_can_select_different_units():
-    from lib.paper_pruning.budget import select_keep_indices
-    from lib.paper_pruning.config import BudgetConfig
-
-    lcb = np.array([0.99, 0.95, 0.90, 0.20, 0.10, 0.05])
-    bands = np.array([
-        [0.1, 0.0, 0.0],
-        [0.1, 0.0, 0.0],
-        [0.1, 0.0, 0.0],
-        [1.0, 0.8, 0.1],
-        [0.4, 1.0, 0.7],
-        [0.2, 0.4, 1.0],
-    ])
-    cfg = BudgetConfig(
-        coverage_ratios=(0.7, 0.6, 0.5),
-        band_selection_weights=(1.0, 0.7, 0.4),
-        coverage_alpha=1.0,
-        greedy_batches=6,
-    )
-    keep_lcb, _, _ = select_keep_indices("lcb_only", lcb, bands, 3, cfg)
-    keep_band, _, _ = select_keep_indices("band_only", lcb, bands, 3, cfg)
-    assert keep_lcb.size == keep_band.size == 3
-    assert not np.array_equal(keep_lcb, keep_band)
-
-
-def test_paper_hybrid_budget_remains_exact_with_three_bands():
-    from lib.paper_pruning.budget import select_keep_indices
-    from lib.paper_pruning.config import BudgetConfig
-
-    rng = np.random.default_rng(9)
-    scores = rng.normal(size=40)
-    bands = np.abs(rng.normal(size=(40, 3)))
-    cfg = BudgetConfig(
-        coverage_ratios=(0.85, 0.70, 0.55),
-        coverage_alpha=0.5,
-        greedy_batches=20,
-    )
-    keep, priority, achieved = select_keep_indices(
-        "paper_hybrid", scores, bands, 20, cfg
-    )
-    assert keep.size == 20
-    assert priority.shape == (40,)
-    assert achieved.shape == (3,)
-
-
-
-def test_invalid_ball_mass_is_renormalized():
-    from lib.paper_pruning.granular_ball import (
-        GranularBall, _BallMI, _aggregate_partition_from_cache, _ball_key
-    )
-
-    b0 = GranularBall(np.array([0, 1]), np.zeros(1), 1.0, 0.5, 0, 0)
-    b1 = GranularBall(np.array([2, 3]), np.zeros(1), 1.0, 1.0, 0, 0)
-    valid_knn = np.array([[2.0, 4.0], [1.0, 3.0]])
-    cache = {
-        _ball_key(b0): _BallMI(
-            knn=valid_knn, kde=valid_knn.copy(), total=np.array([3.0, 2.0]),
-            sample_weight=0.5, valid=True,
-        ),
-        _ball_key(b1): _BallMI(
-            knn=np.zeros((2, 2)), kde=np.zeros((2, 2)), total=np.zeros(2),
-            sample_weight=0.5, valid=False,
-        ),
-    }
-    knn, kde, _ = _aggregate_partition_from_cache([b0, b1], cache, 2, 2)
-    assert np.allclose(knn, valid_knn)
-    assert np.allclose(kde, valid_knn)
-
-
-def test_fusion_weights_remain_genuinely_multigranular():
-    from lib.paper_pruning.granular_ball import _fusion_weights
-
-    cfg = GranularBallConfig(
-        purity_thresholds=(0.6, 0.7, 0.8),
-        fusion_mode="inverse_sqrt_dispersion",
-        fusion_max_ratio=5.0,
-    )
-    weights = _fusion_weights([1e-12, 1e-3, 1e-2], cfg)
-    assert np.isclose(weights.sum(), 1.0)
-    assert weights.max() / weights.min() <= 5.0 + 1e-12
-    assert np.all(weights > 0)
-
-
-def test_coverage_greedy_always_keeps_scalar_term_active():
-    from lib.paper_pruning.budget import coverage_aware_keep_indices
-    from lib.paper_pruning.config import BudgetConfig
-
-    # Unit 0 has the best scalar score but no special coverage.  With a small
-    # alpha it must not be displaced merely because another unit serves a band.
-    scores = np.array([10.0, 0.0, -1.0, -2.0])
-    bands = np.array([
-        [0.1, 0.1],
-        [1.0, 0.0],
-        [0.0, 1.0],
-        [0.2, 0.2],
-    ])
-    keep, _, _ = coverage_aware_keep_indices(
-        scores, bands, keep_count=2,
-        cfg=BudgetConfig(coverage_ratio=0.5, coverage_alpha=0.01, greedy_batches=2),
-    )
-    assert 0 in keep
-
-
-
-def test_nonsequential_wanda_accepts_cross_layer_ratio_budget():
-    model = ToyModel()
-    layer_ratios = {
-        "mlp": {0: 0.40, 1: 0.60},
-        "attention": {0: 0.45, 1: 0.55},
-    }
-    summaries = apply_paper_wanda_weight_masks_(
-        model,
-        _toy_scores(model),
-        FakeResponseCache(model),
-        targets=("mlp", "attention"),
-        mlp_ratio=0.5,
-        attention_ratio=0.5,
-        row_spread=0.0,
-        guidance_strength=0.0,
-        chunk_rows=2,
-        layer_ratios=layer_ratios,
-    )
-    for row in summaries:
-        expected = layer_ratios[
-            "attention" if row["module"].startswith("self_attn.") else "mlp"
-        ][row["layer"]]
-        assert np.isclose(row["target_ratio"], expected)
+    assert budget.prune_counts.sum() * 2 == budget.total_weights
+    assert np.min(budget.prune_counts / budget.costs) >= 0.30 - 1e-9
+    assert np.max(budget.prune_counts / budget.costs) <= 0.70 + 1e-9

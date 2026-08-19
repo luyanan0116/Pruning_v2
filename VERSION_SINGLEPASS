@@ -1,2 +1,0 @@
-deprecated
-Repeated LCB/bootstrap estimation has been restored in v7. Use --paper_lcb_repeats 1 only for explicit single-pass debugging.
