@@ -35,4 +35,5 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0")):
         sparsity=float(args.sparsity_ratio),
         budget=None,
         storage_mode=args.wanda_activation_storage,
+        prune_order=args.prune_order,
     )

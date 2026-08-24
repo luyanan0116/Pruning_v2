@@ -186,8 +186,19 @@ def _forward_layer(layer: nn.Module, hidden: torch.Tensor, kwargs: Mapping[str, 
 
 
 def _metric(module: nn.Linear, stats: ActivationStats) -> torch.Tensor:
-    scale = torch.sqrt(torch.clamp(stats.scaler_row, min=0.0)).reshape(1, -1)
+    # Frozen-stat modes keep scaler_row on CPU to avoid retaining one GPU tensor
+    # per projection for every decoder layer. Move only the small feature vector
+    # back to the module device when its mask is computed.
+    scaler = stats.scaler_row.to(module.weight.device)
+    scale = torch.sqrt(torch.clamp(scaler, min=0.0)).reshape(1, -1)
     return torch.abs(module.weight.data).float() * scale
+
+
+def _stats_to_cpu(stats: Mapping[str, ActivationStats]) -> dict[str, ActivationStats]:
+    return {
+        name: ActivationStats(item.scaler_row.detach().cpu().clone(), int(item.nsamples))
+        for name, item in stats.items()
+    }
 
 
 def _mask_variable_per_row(metric: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
@@ -408,15 +419,30 @@ def sequential_wanda_prune_(
     sparsity: float = 0.50,
     budget: WeightBudget | None = None,
     storage_mode: str = "auto",
+    prune_order: str = "forward",
 ) -> list[dict]:
-    """Sequential Wanda pruning, optionally constrained by paper unit quotas.
+    """Wanda pruning with configurable inter-layer pruning chronology.
 
-    budget=None reproduces the official unstructured Wanda masking rule for the
-    seven Llama projection matrices. With a WeightBudget, exact paper unit prune
-    counts are enforced while Wanda's activation-aware metric selects elements.
+    ``forward`` is the original V8.2 behavior: collect current-layer statistics,
+    prune that layer, then propagate its sparse output so downstream layers see
+    activations produced by the already-pruned prefix.
+
+    ``reverse`` first freezes Wanda activation statistics for every layer on the
+    dense model, then applies masks from the last decoder layer to the first.
+    Downstream pruning cannot causally change an earlier layer's input, so these
+    frozen statistics are the natural reverse-order definition.
+
+    ``joint`` also freezes all dense-model statistics before any weight is zeroed,
+    then applies the resulting layer-local masks in a forward implementation pass.
+    Because Wanda's metric is layer-local, reverse and joint are expected to yield
+    the same final mask; they are kept as separate experiment modes intentionally.
     """
     if abs(float(sparsity) - 0.5) > 1e-12:
         raise ValueError("V8.2 currently targets exactly 50% weight sparsity")
+    prune_order = str(prune_order).lower()
+    if prune_order not in {"forward", "reverse", "joint"}:
+        raise ValueError("prune_order must be one of: forward, reverse, joint")
+
     layers = _layers(model)
     use_cache = bool(getattr(model.config, "use_cache", False))
     model.config.use_cache = False
@@ -424,30 +450,67 @@ def sequential_wanda_prune_(
         model, dataloader, nsamples=nsamples, seqlen=seqlen, storage_mode=storage_mode
     )
     print(
-        f"[wanda mask] sequential calibration nsamples={nsamples}, seqlen={seqlen}, "
+        f"[wanda mask] mode={prune_order}, calibration nsamples={nsamples}, seqlen={seqlen}, "
         f"activation_storage={storage}",
         flush=True,
     )
 
     summaries: list[dict] = []
+
+    def prune_one(layer_id: int, layer: nn.Module, stats: Mapping[str, ActivationStats]) -> None:
+        if budget is None:
+            layer_rows = _prune_layer_wanda_uniform(layer, stats, sparsity)
+        else:
+            layer_rows = _prune_layer_paper_budget(
+                model, layer_id, layer, stats, budget, anchor_sparsity=sparsity
+            )
+        for row in layer_rows:
+            row["layer"] = layer_id
+            row["prune_order"] = prune_order
+            summaries.append(row)
+
     try:
-        for layer_id, layer in enumerate(layers):
-            print(f"[wanda mask] layer {layer_id + 1}/{len(layers)} collect -> prune -> propagate", flush=True)
-            stats = _collect_stats_for_layer(layer, inps, outs, layer_kwargs, nsamples)
-            if budget is None:
-                layer_rows = _prune_layer_wanda_uniform(layer, stats, sparsity)
-            else:
-                layer_rows = _prune_layer_paper_budget(
-                    model, layer_id, layer, stats, budget, anchor_sparsity=sparsity
+        if prune_order == "forward":
+            for layer_id, layer in enumerate(layers):
+                print(
+                    f"[wanda mask] layer {layer_id + 1}/{len(layers)} collect -> prune -> propagate",
+                    flush=True,
                 )
-            for row in layer_rows:
-                row["layer"] = layer_id
-                summaries.append(row)
-            _propagate_pruned_layer(layer, inps, outs, layer_kwargs, nsamples)
-            inps, outs = outs, inps
-            del stats
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                stats = _collect_stats_for_layer(layer, inps, outs, layer_kwargs, nsamples)
+                prune_one(layer_id, layer, stats)
+                _propagate_pruned_layer(layer, inps, outs, layer_kwargs, nsamples)
+                inps, outs = outs, inps
+                del stats
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        else:
+            # Phase 1: calculate/freeze every layer's Wanda statistics before any
+            # pruning. Only compact per-input-feature energy vectors are retained.
+            frozen_stats: list[dict[str, ActivationStats]] = []
+            for layer_id, layer in enumerate(layers):
+                print(
+                    f"[wanda mask] freeze dense stats layer {layer_id + 1}/{len(layers)}",
+                    flush=True,
+                )
+                stats = _collect_stats_for_layer(layer, inps, outs, layer_kwargs, nsamples)
+                frozen_stats.append(_stats_to_cpu(stats))
+                inps, outs = outs, inps
+                del stats
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            if prune_order == "reverse":
+                apply_ids = range(len(layers) - 1, -1, -1)
+            else:
+                apply_ids = range(len(layers))
+            for step, layer_id in enumerate(apply_ids, start=1):
+                print(
+                    f"[wanda mask] {prune_order} apply {step}/{len(layers)}: layer {layer_id + 1}",
+                    flush=True,
+                )
+                prune_one(layer_id, layers[layer_id], frozen_stats[layer_id])
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
     finally:
         model.config.use_cache = use_cache
 
@@ -460,3 +523,4 @@ def sequential_wanda_prune_(
     if total_pruned != expected:
         raise RuntimeError(f"activation-aware masker pruned {total_pruned}, expected {expected}")
     return summaries
+

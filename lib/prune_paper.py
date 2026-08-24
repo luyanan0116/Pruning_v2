@@ -287,6 +287,7 @@ def prune_paper(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
             seqlen=args.wanda_calib_seqlen or model.seqlen,
             sparsity=args.sparsity_ratio, budget=None,
             storage_mode=args.wanda_activation_storage,
+            prune_order=args.prune_order,
         )
 
     cache_dir = Path(args.paper_cache_dir)
@@ -320,6 +321,15 @@ def prune_paper(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
     if args.paper_band_coverage_ratios is not None:
         coverage_ratios = _parse_float_tuple(args.paper_band_coverage_ratios)
 
+    effective_coverage_alpha = (
+        float(args.paper_coverage_alpha) if bool(args.paper_use_band_gradient) else 0.0
+    )
+    print(
+        f"[paper band gradient] enabled={bool(args.paper_use_band_gradient)}, "
+        f"coverage_alpha={effective_coverage_alpha:.6g}",
+        flush=True,
+    )
+
     budget = allocate_weight_budget(
         model,
         method,
@@ -332,7 +342,7 @@ def prune_paper(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
         projection_temperature=args.paper_budget_temperature,
         coverage_ratio=args.paper_band_coverage_ratio,
         coverage_ratios=coverage_ratios,
-        coverage_alpha=args.paper_coverage_alpha,
+        coverage_alpha=effective_coverage_alpha,
         greedy_batches=args.paper_greedy_batches,
     )
     print(
@@ -352,6 +362,7 @@ def prune_paper(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
         seqlen=args.wanda_calib_seqlen or model.seqlen,
         sparsity=args.sparsity_ratio, budget=budget,
         storage_mode=args.wanda_activation_storage,
+        prune_order=args.prune_order,
     )
     budget_path = report_dir / f"weight_budget_{method}.csv"
     write_weight_budget(budget_path, budget, summaries)

@@ -109,6 +109,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wanda_calib_seqlen", type=int, default=4096)
     parser.add_argument("--wanda_activation_storage", choices=["auto", "cuda", "cpu"], default="auto",
                         help="where to store sequential 128xseqlen hidden-state buffers")
+    parser.add_argument(
+        "--prune_order", choices=["forward", "reverse", "joint"], default="forward",
+        help=("inter-layer mask chronology: forward=V8.2 prune/propagate; "
+              "reverse=freeze all dense stats then last->first; "
+              "joint=freeze all dense stats before applying any masks")
+    )
 
     # Paper contribution -> bounded unit quota.
     parser.add_argument("--paper_prune_targets", default="mlp,attention")
@@ -162,6 +168,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--paper_band_coverage_ratio", type=float, default=0.90)
     parser.add_argument("--paper_band_coverage_ratios", default=None)
     parser.add_argument("--paper_coverage_alpha", type=float, default=0.10)
+    parser.add_argument(
+        "--paper_use_band_gradient", action=argparse.BooleanOptionalAction, default=True,
+        help=("enable/disable the Full-method frequency-band coverage gradient/refinement; "
+              "--no-paper_use_band_gradient forces coverage alpha to 0")
+    )
     parser.add_argument("--paper_greedy_batches", type=int, default=8,
                         help="V8.2 Full coverage-projection refinement iterations")
 
