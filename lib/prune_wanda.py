@@ -36,4 +36,5 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0")):
         budget=None,
         storage_mode=args.wanda_activation_storage,
         prune_order=args.prune_order,
+        frozen_stats_cache_dir=getattr(args, "wanda_stats_cache_dir", None),
     )

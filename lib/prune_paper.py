@@ -157,12 +157,14 @@ def _load_evidence(path: Path) -> Dict[str, Dict[str, Dict[int, Dict[str, np.nda
 def _score_or_load(args, cache, report_dir: Path, targets: tuple[str, ...]):
     config = _pipeline_config(args)
     payload = _score_config_payload(args, config, cache, targets)
-    config_path = report_dir / "score_config.json"
-    evidence_path = report_dir / "unit_evidence.npz"
+    score_cache_dir = Path(args.paper_score_cache_dir) if args.paper_score_cache_dir else report_dir
+    score_cache_dir.mkdir(parents=True, exist_ok=True)
+    config_path = score_cache_dir / "score_config.json"
+    evidence_path = score_cache_dir / "unit_evidence.npz"
     if evidence_path.exists() and config_path.exists() and not args.paper_overwrite_scores:
         previous = json.loads(config_path.read_text(encoding="utf-8"))
         if previous == payload:
-            print(f"reusing paper contribution evidence from {report_dir}")
+            print(f"reusing paper contribution evidence from {score_cache_dir}")
             return _load_evidence(evidence_path)
         print("paper contribution configuration changed; recomputing evidence")
 
@@ -288,6 +290,7 @@ def prune_paper(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
             sparsity=args.sparsity_ratio, budget=None,
             storage_mode=args.wanda_activation_storage,
             prune_order=args.prune_order,
+            frozen_stats_cache_dir=args.wanda_stats_cache_dir,
         )
 
     cache_dir = Path(args.paper_cache_dir)
@@ -363,6 +366,7 @@ def prune_paper(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
         sparsity=args.sparsity_ratio, budget=budget,
         storage_mode=args.wanda_activation_storage,
         prune_order=args.prune_order,
+        frozen_stats_cache_dir=args.wanda_stats_cache_dir,
     )
     budget_path = report_dir / f"weight_budget_{method}.csv"
     write_weight_budget(budget_path, budget, summaries)

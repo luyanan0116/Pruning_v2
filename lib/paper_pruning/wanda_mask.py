@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+from pathlib import Path
 from typing import Mapping, Sequence
 
 import numpy as np
@@ -411,6 +413,91 @@ def _prune_layer_paper_budget(
     return summaries
 
 
+
+FROZEN_STATS_CACHE_VERSION = 1
+
+
+def _frozen_stats_signature(model: nn.Module, nsamples: int, seqlen: int) -> dict:
+    layers = _layers(model)
+    module_dims = []
+    for layer in layers:
+        module_dims.append({
+            name: int(_get_module(layer, name).weight.shape[1])
+            for name in TARGET_MODULE_NAMES
+        })
+    return {
+        "cache_version": FROZEN_STATS_CACHE_VERSION,
+        "nsamples": int(nsamples),
+        "seqlen": int(seqlen),
+        "num_layers": int(len(layers)),
+        "module_input_dims": module_dims,
+    }
+
+
+def _save_frozen_stats_cache(
+    cache_dir: str | Path,
+    model: nn.Module,
+    frozen_stats: Sequence[Mapping[str, ActivationStats]],
+    nsamples: int,
+    seqlen: int,
+) -> None:
+    root = Path(cache_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    signature = _frozen_stats_signature(model, nsamples, seqlen)
+    for layer_id, stats in enumerate(frozen_stats):
+        payload = {
+            name: {
+                "scaler_row": item.scaler_row.detach().cpu(),
+                "nsamples": int(item.nsamples),
+            }
+            for name, item in stats.items()
+        }
+        torch.save(payload, root / f"layer_{layer_id:03d}.pt")
+    (root / "metadata.json").write_text(
+        json.dumps(signature, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def _load_frozen_stats_cache(
+    cache_dir: str | Path,
+    model: nn.Module,
+    nsamples: int,
+    seqlen: int,
+) -> list[dict[str, ActivationStats]] | None:
+    root = Path(cache_dir)
+    meta_path = root / "metadata.json"
+    if not meta_path.exists():
+        return None
+    try:
+        actual = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    expected = _frozen_stats_signature(model, nsamples, seqlen)
+    if actual != expected:
+        print("[wanda stats cache] metadata mismatch; recomputing frozen dense stats", flush=True)
+        return None
+    result: list[dict[str, ActivationStats]] = []
+    for layer_id in range(len(_layers(model))):
+        path = root / f"layer_{layer_id:03d}.pt"
+        if not path.exists():
+            print(f"[wanda stats cache] missing {path.name}; recomputing", flush=True)
+            return None
+        payload = torch.load(path, map_location="cpu")
+        stats = {
+            name: ActivationStats(
+                scaler_row=item["scaler_row"].detach().cpu().float(),
+                nsamples=int(item["nsamples"]),
+            )
+            for name, item in payload.items()
+        }
+        if set(stats) != set(TARGET_MODULE_NAMES):
+            print(f"[wanda stats cache] invalid module set in {path.name}; recomputing", flush=True)
+            return None
+        result.append(stats)
+    print(f"[wanda stats cache] reused frozen dense stats from {root}", flush=True)
+    return result
+
+
 def sequential_wanda_prune_(
     model: nn.Module,
     dataloader,
@@ -420,6 +507,7 @@ def sequential_wanda_prune_(
     budget: WeightBudget | None = None,
     storage_mode: str = "auto",
     prune_order: str = "forward",
+    frozen_stats_cache_dir: str | Path | None = None,
 ) -> list[dict]:
     """Wanda pruning with configurable inter-layer pruning chronology.
 
@@ -427,15 +515,10 @@ def sequential_wanda_prune_(
     prune that layer, then propagate its sparse output so downstream layers see
     activations produced by the already-pruned prefix.
 
-    ``reverse`` first freezes Wanda activation statistics for every layer on the
-    dense model, then applies masks from the last decoder layer to the first.
-    Downstream pruning cannot causally change an earlier layer's input, so these
-    frozen statistics are the natural reverse-order definition.
-
-    ``joint`` also freezes all dense-model statistics before any weight is zeroed,
-    then applies the resulting layer-local masks in a forward implementation pass.
-    Because Wanda's metric is layer-local, reverse and joint are expected to yield
-    the same final mask; they are kept as separate experiment modes intentionally.
+    ``reverse`` and ``joint`` freeze Wanda activation statistics on the dense
+    model before any mask is applied. Those dense statistics can therefore be
+    cached and safely reused across reverse/joint and band on/off experiments,
+    provided the calibration sample count/length and model architecture match.
     """
     if abs(float(sparsity) - 0.5) > 1e-12:
         raise ValueError("V8.2 currently targets exactly 50% weight sparsity")
@@ -446,15 +529,6 @@ def sequential_wanda_prune_(
     layers = _layers(model)
     use_cache = bool(getattr(model.config, "use_cache", False))
     model.config.use_cache = False
-    inps, outs, layer_kwargs, storage = prepare_calibration_inputs(
-        model, dataloader, nsamples=nsamples, seqlen=seqlen, storage_mode=storage_mode
-    )
-    print(
-        f"[wanda mask] mode={prune_order}, calibration nsamples={nsamples}, seqlen={seqlen}, "
-        f"activation_storage={storage}",
-        flush=True,
-    )
-
     summaries: list[dict] = []
 
     def prune_one(layer_id: int, layer: nn.Module, stats: Mapping[str, ActivationStats]) -> None:
@@ -471,6 +545,14 @@ def sequential_wanda_prune_(
 
     try:
         if prune_order == "forward":
+            inps, outs, layer_kwargs, storage = prepare_calibration_inputs(
+                model, dataloader, nsamples=nsamples, seqlen=seqlen, storage_mode=storage_mode
+            )
+            print(
+                f"[wanda mask] mode={prune_order}, calibration nsamples={nsamples}, seqlen={seqlen}, "
+                f"activation_storage={storage}",
+                flush=True,
+            )
             for layer_id, layer in enumerate(layers):
                 print(
                     f"[wanda mask] layer {layer_id + 1}/{len(layers)} collect -> prune -> propagate",
@@ -484,20 +566,42 @@ def sequential_wanda_prune_(
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
         else:
-            # Phase 1: calculate/freeze every layer's Wanda statistics before any
-            # pruning. Only compact per-input-feature energy vectors are retained.
-            frozen_stats: list[dict[str, ActivationStats]] = []
-            for layer_id, layer in enumerate(layers):
+            frozen_stats = None
+            if frozen_stats_cache_dir:
+                frozen_stats = _load_frozen_stats_cache(
+                    frozen_stats_cache_dir, model, nsamples=nsamples, seqlen=seqlen
+                )
+
+            if frozen_stats is None:
+                inps, outs, layer_kwargs, storage = prepare_calibration_inputs(
+                    model, dataloader, nsamples=nsamples, seqlen=seqlen, storage_mode=storage_mode
+                )
                 print(
-                    f"[wanda mask] freeze dense stats layer {layer_id + 1}/{len(layers)}",
+                    f"[wanda mask] mode={prune_order}, calibration nsamples={nsamples}, seqlen={seqlen}, "
+                    f"activation_storage={storage}",
                     flush=True,
                 )
-                stats = _collect_stats_for_layer(layer, inps, outs, layer_kwargs, nsamples)
-                frozen_stats.append(_stats_to_cpu(stats))
-                inps, outs = outs, inps
-                del stats
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                frozen_stats = []
+                for layer_id, layer in enumerate(layers):
+                    print(
+                        f"[wanda mask] freeze dense stats layer {layer_id + 1}/{len(layers)}",
+                        flush=True,
+                    )
+                    stats = _collect_stats_for_layer(layer, inps, outs, layer_kwargs, nsamples)
+                    frozen_stats.append(_stats_to_cpu(stats))
+                    inps, outs = outs, inps
+                    del stats
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                if frozen_stats_cache_dir:
+                    _save_frozen_stats_cache(
+                        frozen_stats_cache_dir, model, frozen_stats,
+                        nsamples=nsamples, seqlen=seqlen,
+                    )
+                    print(
+                        f"[wanda stats cache] saved frozen dense stats to {frozen_stats_cache_dir}",
+                        flush=True,
+                    )
 
             if prune_order == "reverse":
                 apply_ids = range(len(layers) - 1, -1, -1)
@@ -523,4 +627,3 @@ def sequential_wanda_prune_(
     if total_pruned != expected:
         raise RuntimeError(f"activation-aware masker pruned {total_pruned}, expected {expected}")
     return summaries
-

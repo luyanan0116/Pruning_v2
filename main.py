@@ -108,7 +108,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wanda_nsamples", type=int, default=128)
     parser.add_argument("--wanda_calib_seqlen", type=int, default=4096)
     parser.add_argument("--wanda_activation_storage", choices=["auto", "cuda", "cpu"], default="auto",
-                        help="where to store sequential 128xseqlen hidden-state buffers")
+                        help="where to store sequential nsamples x seqlen hidden-state buffers")
+    parser.add_argument("--wanda_stats_cache_dir", default=None,
+                        help=("optional cache for frozen dense Wanda activation statistics used by "
+                              "reverse/joint modes; safe to share across band on/off when calibration settings match"))
     parser.add_argument(
         "--prune_order", choices=["forward", "reverse", "joint"], default="forward",
         help=("inter-layer mask chronology: forward=V8.2 prune/propagate; "
@@ -177,6 +180,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="V8.2 Full coverage-projection refinement iterations")
 
     parser.add_argument("--paper_cache_dir", default="paper_response_cache")
+    parser.add_argument("--paper_score_cache_dir", default=None,
+                        help="optional shared cache directory for MI/GB/LCB unit evidence across experiment variants")
     parser.add_argument("--paper_report_dir", default="paper_report")
     parser.add_argument("--paper_overwrite_cache", action="store_true")
     parser.add_argument("--paper_overwrite_scores", action="store_true")
